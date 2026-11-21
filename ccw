@@ -1,0 +1,1110 @@
+#!/usr/bin/env python3
+"""ccw - Claude Code Wrapper.
+
+Runs ``claude -p`` headlessly, watches its output for the 5-hour session
+limit message, sleeps until the limit resets and resumes the same
+directory-scoped session with ``claude --continue -p "<resume prompt>"``.
+
+Zero dependencies: Python 3.8+ standard library only. Single file.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import contextlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Callable, Mapping, NoReturn, Sequence, TextIO
+
+__version__ = "0.1.0"
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+
+EXIT_OK = 0
+EXIT_USAGE = 1          # invalid arguments / environment
+EXIT_LOCKED = 1         # another ccw is active in this directory
+EXIT_MAX_RETRIES = 2
+EXIT_INTERRUPTED = 130
+
+DEFAULT_RESUME_PROMPT = "作業を再開してください"
+DEFAULT_MAX_RETRIES = 5
+DEFAULT_FALLBACK_WAIT = 18000
+DEFAULT_BUFFER_SEC = 15
+
+LOCK_FILENAME = ".ccw.lock"
+LOCK_MAX_BYTES = 64 * 1024
+# A lock file that exists but cannot be parsed may be in the middle of being
+# written by another ccw. Only treat it as stale once it is this old.
+LOCK_CORRUPT_GRACE_SEC = 10.0
+
+OUTPUT_BUFFER_LINES = 200
+# The limit message is printed when claude stops, so it is among the last
+# lines. Only the tail is inspected so that a limit phrase quoted somewhere
+# in the middle of normal output does not trigger a wait.
+DETECT_TAIL_LINES = 5
+STATUS_INTERVAL_SEC = 60.0
+TERMINATE_TIMEOUT_SEC = 5.0
+
+ENV_CLAUDE_CMD = "CCW_CLAUDE_CMD"
+_CLAUDE_PKG_PARTS = ("node_modules", "@anthropic-ai", "claude-code")
+
+# --------------------------------------------------------------------------
+# Limit detection & reset time parsing
+# --------------------------------------------------------------------------
+
+LIMIT_PATTERN = re.compile(
+    r"\b5[-\s]?hour\s+limit"
+    r"|\bsession\s+limit\s+reached"
+    r"|\busage\s+limit\s+reached"
+    r"|\bhit\s+your\s+(?:usage\s+|session\s+)?limit",
+    re.IGNORECASE,
+)
+
+_TIME_PREFIX = r"(?:\bat|\bresets?(?:\s+at)?|\buntil)"
+TIME_12H_PATTERN = re.compile(
+    _TIME_PREFIX + r"\s+(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m(?![a-z])\.?",
+    re.IGNORECASE,
+)
+TIME_24H_PATTERN = re.compile(
+    _TIME_PREFIX + r"\s+(\d{1,2}):(\d{2})(?!\d)(?!\s*[ap]\.?m(?![a-z]))",
+    re.IGNORECASE,
+)
+RELATIVE_PATTERN = re.compile(
+    r"\bin\s+"
+    r"(?:(\d+)\s*(?:hours?|hrs?|h)(?![a-z]))?"
+    r"(?:\s*(?:,|and)?\s*)"
+    r"(?:(\d+)\s*(?:minutes?|mins?|m)(?![a-z]))?",
+    re.IGNORECASE,
+)
+# Older Claude Code versions print "Claude AI usage limit reached|<epoch>".
+EPOCH_PATTERN = re.compile(r"\|\s*(\d{10})(?!\d)")
+
+
+@dataclass(frozen=True)
+class LimitInfo:
+    detected: bool
+    reset_at: datetime | None
+    raw_line: str
+
+
+def _next_clock_time(now: datetime, hour: int, minute: int) -> datetime:
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def parse_reset_time(text: str, now: datetime | None = None) -> datetime | None:
+    """Extract the reset moment from ``text`` as a naive local datetime."""
+    if now is None:
+        now = datetime.now()
+
+    m = EPOCH_PATTERN.search(text)
+    if m:
+        try:
+            return datetime.fromtimestamp(int(m.group(1)))
+        except (OverflowError, OSError, ValueError):
+            pass
+
+    m = TIME_12H_PATTERN.search(text)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        if 1 <= hour <= 12 and 0 <= minute <= 59:
+            hour24 = hour % 12 + (12 if m.group(3).lower() == "p" else 0)
+            return _next_clock_time(now, hour24, minute)
+
+    m = TIME_24H_PATTERN.search(text)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return _next_clock_time(now, hour, minute)
+
+    for m in RELATIVE_PATTERN.finditer(text):
+        hours, minutes = m.group(1), m.group(2)
+        if hours is None and minutes is None:
+            continue
+        delta = timedelta(hours=int(hours or 0), minutes=int(minutes or 0))
+        return now + delta
+
+    return None
+
+
+def parse_limit_message(line: str, now: datetime | None = None) -> LimitInfo:
+    """Inspect one output line for the 5-hour/session limit message."""
+    if not LIMIT_PATTERN.search(line):
+        return LimitInfo(False, None, "")
+    return LimitInfo(True, parse_reset_time(line, now), line.rstrip("\r\n"))
+
+
+def detect_limit(lines: Sequence[str], now: datetime | None = None) -> LimitInfo:
+    """Look for the limit message in the tail of the captured output.
+
+    If the matching line carries no time, the following one or two lines are
+    checked as well (some versions print "resets 3pm" on its own line).
+    """
+    if now is None:
+        now = datetime.now()
+    tail = [ln for ln in lines if ln.strip()][-DETECT_TAIL_LINES:]
+    for idx in range(len(tail) - 1, -1, -1):
+        info = parse_limit_message(tail[idx], now)
+        if not info.detected:
+            continue
+        if info.reset_at is None:
+            for follow in tail[idx + 1:idx + 3]:
+                reset_at = parse_reset_time(follow, now)
+                if reset_at is not None:
+                    return LimitInfo(True, reset_at, info.raw_line)
+        return info
+    return LimitInfo(False, None, "")
+
+
+def compute_wait_seconds(
+    info: LimitInfo,
+    now: datetime,
+    buffer_sec: int = DEFAULT_BUFFER_SEC,
+    fallback_wait: int = DEFAULT_FALLBACK_WAIT,
+) -> float:
+    """Seconds to sleep before resuming."""
+    if info.reset_at is None:
+        return float(fallback_wait)
+    remaining = (info.reset_at - now).total_seconds()
+    return max(0.0, remaining) + float(buffer_sec)
+
+
+# --------------------------------------------------------------------------
+# Secret redaction
+# --------------------------------------------------------------------------
+
+_MASK = "***REDACTED***"
+
+_REDACT_RULES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"), "sk-ant-" + _MASK),
+    (re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}"), "sk-" + _MASK),
+    (re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"), r"\1" + _MASK),
+    (re.compile(r"\b(gh[pousr]_)[A-Za-z0-9]{20,}"), r"\1" + _MASK),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "github_pat_" + _MASK),
+    (re.compile(r"\b(xox[abprs]-)[A-Za-z0-9\-]{10,}"), r"\1" + _MASK),
+    (re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9\-._~+/]{8,}=*"), r"\1" + _MASK),
+    # ENV-style assignments: AWS_SECRET_ACCESS_KEY=..., GITHUB_TOKEN: ...
+    # Case-sensitive on purpose so prose such as "max_tokens: 1000" is kept.
+    (
+        re.compile(
+            r"(\b[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|PRIVATE_KEY)"
+            r"[A-Z0-9_]*[\"']?\s*[=:]\s*)([\"']?)[^\s\"']{4,}"
+        ),
+        r"\1\2" + _MASK,
+    ),
+    # JSON-style: "api_key": "...", "client_secret": "..."
+    (
+        re.compile(
+            r"(?i)(\"(?:api[_-]?key|secret|client[_-]?secret|token|access[_-]?token|"
+            r"refresh[_-]?token|password)\"\s*:\s*\")[^\"]{4,}(\")"
+        ),
+        r"\1" + _MASK + r"\2",
+    ),
+]
+
+_PEM_INLINE = re.compile(
+    r"(-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----).*?(-----END [A-Z0-9 ]*PRIVATE KEY-----)"
+)
+_PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+_PEM_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
+
+
+def redact_secrets(text: str) -> str:
+    """Mask well-known secret formats in a single line of text."""
+    for pattern, repl in _REDACT_RULES:
+        text = pattern.sub(repl, text)
+    return text
+
+
+class Redactor:
+    """Line-by-line redactor that also masks multi-line PEM private keys."""
+
+    def __init__(self) -> None:
+        self._in_private_key = False
+
+    def redact(self, line: str) -> str:
+        body = line.rstrip("\r\n")
+        ending = line[len(body):]
+
+        if self._in_private_key:
+            end = _PEM_END.search(body)
+            if end is None:
+                return _MASK + ending
+            self._in_private_key = False
+            return _MASK + body[end.start():] + ending
+
+        body = _PEM_INLINE.sub(r"\1" + _MASK + r"\2", body)
+        begin = _PEM_BEGIN.search(body)
+        if begin is not None and _PEM_END.search(body, begin.end()) is None:
+            self._in_private_key = True
+            body = body[:begin.end()] + _MASK
+        return redact_secrets(body) + ending
+
+
+# --------------------------------------------------------------------------
+# Lock file
+# --------------------------------------------------------------------------
+
+
+class LockError(Exception):
+    """The lock could not be taken (symlink, I/O error, contention)."""
+
+
+class LockHeldError(LockError):
+    def __init__(self, path: str, pid: int | None) -> None:
+        who = f"PID {pid}" if pid is not None else "another process"
+        super().__init__(f"another ccw ({who}) is already running here: {path}")
+        self.path = path
+        self.pid = pid
+
+
+_LOCK_CREATE_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOINHERIT", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+_LOCK_READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOINHERIT", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+
+
+def lock_path_for(directory: str) -> str:
+    return os.path.join(directory, LOCK_FILENAME)
+
+
+def _is_pid_alive_posix(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except OSError:
+        return False
+    return True
+
+
+def _is_pid_alive_windows(pid: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_ACCESS_DENIED = 5
+
+    if pid > 0xFFFFFFFF:
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    open_process.restype = wintypes.HANDLE
+    get_exit_code = kernel32.GetExitCodeProcess
+    get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    get_exit_code.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_process(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # Access denied means the process exists but is protected; treat it
+        # as alive rather than stealing its lock.
+        return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+    try:
+        code = wintypes.DWORD()
+        if not get_exit_code(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        close_handle(handle)
+
+
+def is_pid_alive(pid: int) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    if os.name == "nt":
+        return _is_pid_alive_windows(pid)
+    return _is_pid_alive_posix(pid)
+
+
+def _reject_symlink(path: str) -> None:
+    if os.path.islink(path):
+        raise LockError(f"refusing to use a symlinked lock file: {path}")
+
+
+def read_lock(path: str) -> dict[str, object] | None:
+    """Return the lock's JSON object, or None if it is unreadable/invalid.
+
+    Raises FileNotFoundError if the file vanished and LockError if it is a
+    symlink.
+    """
+    _reject_symlink(path)
+    try:
+        fd = os.open(path, _LOCK_READ_FLAGS)
+    except FileNotFoundError:
+        raise  # let the caller retry
+    except OSError as exc:  # e.g. ELOOP from O_NOFOLLOW
+        raise LockError(f"cannot open lock file {path}: {exc}") from exc
+    try:
+        data = os.read(fd, LOCK_MAX_BYTES)
+    finally:
+        os.close(fd)
+    try:
+        obj = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    pid = obj.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return None
+    return obj
+
+
+def _lock_age_seconds(path: str) -> float:
+    try:
+        return time.time() - os.lstat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
+def acquire_lock(
+    directory: str,
+    pid: int | None = None,
+    is_alive: Callable[[int], bool] = is_pid_alive,
+) -> str:
+    """Create ``<directory>/.ccw.lock`` exclusively and return its path."""
+    if pid is None:
+        pid = os.getpid()
+    path = lock_path_for(directory)
+    payload = json.dumps(
+        {
+            "pid": pid,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "cwd": os.path.abspath(directory),
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    for _ in range(3):
+        _reject_symlink(path)
+        try:
+            fd = os.open(path, _LOCK_CREATE_FLAGS, 0o600)
+        except FileExistsError:
+            try:
+                existing = read_lock(path)
+            except FileNotFoundError:
+                continue  # removed meanwhile; try again
+            if existing is None:
+                if _lock_age_seconds(path) < LOCK_CORRUPT_GRACE_SEC:
+                    raise LockHeldError(path, None) from None
+            else:
+                other = int(existing["pid"])  # type: ignore[arg-type]
+                if other == pid or is_alive(other):
+                    raise LockHeldError(path, other) from None
+            _reject_symlink(path)
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)  # stale lock
+            continue
+        except OSError as exc:
+            raise LockError(f"cannot create lock file {path}: {exc}") from exc
+
+        try:
+            if os.name != "nt":
+                os.fchmod(fd, 0o600)
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+        finally:
+            os.close(fd)
+        return path
+
+    raise LockError(f"could not acquire lock (contention): {path}")
+
+
+def release_lock(path: str | None, pid: int | None = None) -> bool:
+    """Remove the lock only if it is a regular file owned by ``pid``."""
+    if not path:
+        return False
+    if pid is None:
+        pid = os.getpid()
+    try:
+        data = read_lock(path)
+    except (FileNotFoundError, LockError):
+        return False
+    if data is None or data.get("pid") != pid:
+        return False
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------
+# Resolving the claude executable
+# --------------------------------------------------------------------------
+
+
+class ClaudeNotFoundError(Exception):
+    pass
+
+
+def _is_batch(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in (".cmd", ".bat")
+
+
+def _resolve_windows_shim(path: str, which: Callable[[str], str | None]) -> list[str]:
+    """Turn an npm shim into a command that does not go through cmd.exe.
+
+    Arguments passed to a .cmd/.bat file are re-parsed by cmd.exe even with
+    shell=False (the "BatBadBut" problem), so prompt text could inject
+    commands. We start the real executable behind the shim instead.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in (".exe", ".com"):
+        return [path]
+    pkg = os.path.join(os.path.dirname(path), *_CLAUDE_PKG_PARTS)
+    exe = os.path.join(pkg, "bin", "claude.exe")
+    if os.path.isfile(exe):
+        return [exe]
+    cli = os.path.join(pkg, "cli.js")
+    if os.path.isfile(cli):
+        node = which("node")
+        if node and os.path.splitext(node)[1].lower() == ".exe":
+            return [node, cli]
+    raise ClaudeNotFoundError(
+        f"'claude' resolves to a script shim ({path}) and its real executable "
+        "could not be found. Running it through cmd.exe is unsafe; set "
+        f"{ENV_CLAUDE_CMD} to a JSON array that starts with an .exe, e.g. "
+        '["C:\\\\path\\\\to\\\\claude.exe"].'
+    )
+
+
+def resolve_claude_command(
+    environ: Mapping[str, str] | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+    is_windows: bool | None = None,
+) -> list[str]:
+    """Return the argv prefix used to start claude."""
+    if environ is None:
+        environ = os.environ
+    if is_windows is None:
+        is_windows = os.name == "nt"
+
+    raw = environ.get(ENV_CLAUDE_CMD)
+    if raw:
+        try:
+            cmd = json.loads(raw)
+        except ValueError as exc:
+            raise ClaudeNotFoundError(f"{ENV_CLAUDE_CMD} must be a JSON array of strings") from exc
+        if not isinstance(cmd, list) or not cmd or not all(isinstance(c, str) and c for c in cmd):
+            raise ClaudeNotFoundError(f"{ENV_CLAUDE_CMD} must be a non-empty JSON array of strings")
+        if is_windows and _is_batch(cmd[0]):
+            raise ClaudeNotFoundError(f"{ENV_CLAUDE_CMD} must not start with a .cmd/.bat file")
+        return list(cmd)
+
+    path = which("claude")
+    if not path:
+        raise ClaudeNotFoundError("'claude' was not found on PATH")
+    if is_windows:
+        return _resolve_windows_shim(path, which)
+    return [path]
+
+
+# --------------------------------------------------------------------------
+# Child process
+# --------------------------------------------------------------------------
+
+
+class ChildRunner:
+    """Runs claude, streams redacted output and keeps a rolling buffer."""
+
+    def __init__(self, out: TextIO, env: Mapping[str, str] | None = None) -> None:
+        self.out = out
+        self.env = env
+        self.proc: subprocess.Popen | None = None  # type: ignore[type-arg]
+
+    def run(self, cmd: Sequence[str], stdin_text: str | None = None) -> tuple[int, collections.deque[str]]:
+        env = dict(os.environ if self.env is None else self.env)
+        env["PYTHONUTF8"] = "1"
+        buffer: collections.deque[str] = collections.deque(maxlen=OUTPUT_BUFFER_LINES)
+        redactor = Redactor()
+
+        self.proc = subprocess.Popen(
+            list(cmd),
+            shell=False,
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+        )
+        proc = self.proc
+        feeder: threading.Thread | None = None
+        if stdin_text is not None:
+            feeder = threading.Thread(target=_feed_stdin, args=(proc, stdin_text), daemon=True)
+            feeder.start()
+
+        assert proc.stdout is not None
+        for line in iter(proc.stdout.readline, ""):
+            masked = redactor.redact(line)
+            self.out.write(masked)
+            self.out.flush()
+            buffer.append(masked)
+        proc.stdout.close()
+        rc = proc.wait()
+        if feeder is not None:
+            feeder.join(timeout=1.0)
+        self.proc = None
+        return _normalize_exit_code(rc), buffer
+
+    def terminate(self, wait: bool = True) -> None:
+        """Stop the running child. ``wait=False`` kills it without waiting."""
+        proc = self.proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            if not wait:
+                proc.kill()
+                return
+            proc.terminate()
+            proc.wait(timeout=TERMINATE_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        except OSError:
+            pass
+
+
+# Exit status of a Windows process ended by Ctrl+C / Ctrl+Break.
+STATUS_CONTROL_C_EXIT = 0xC000013A
+
+
+def _normalize_exit_code(rc: int) -> int:
+    """Map a child killed by a signal or console Ctrl event to ``128 + signum``.
+
+    POSIX reports a signal death as ``-signum``. On Windows, Ctrl+C / Ctrl+Break
+    reach the whole console group, so claude may exit with
+    STATUS_CONTROL_C_EXIT before ccw's own handler runs; report that as an
+    interruption (130) as well.
+    """
+    if rc < 0:
+        return 128 - rc
+    if rc == STATUS_CONTROL_C_EXIT:
+        return EXIT_INTERRUPTED
+    return rc
+
+
+def _feed_stdin(proc: subprocess.Popen[str], text: str) -> None:
+    assert proc.stdin is not None
+    try:
+        proc.stdin.write(text)
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    finally:
+        with contextlib.suppress(BrokenPipeError, OSError, ValueError):
+            proc.stdin.close()
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+class UsageError(Exception):
+    pass
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        raise UsageError(message)
+
+
+def _non_negative_int(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid integer: {value!r}") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0: {value!r}")
+    return number
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _ArgumentParser(
+        prog="ccw",
+        description="Run claude -p and auto-resume after the 5-hour session limit.",
+        usage=('ccw [ccw-options] "<initial prompt>" [-- claude-options...]\n'
+               '       ccw [ccw-options] (--stdin | --prompt-file PATH) [-- claude-options...]'),
+        epilog=("Options after -- are passed to claude on the initial run and on every "
+                "resume (e.g. --model, --allowedTools, --permission-mode). "
+                "-p/--print, -c/--continue and -r/--resume are managed by ccw."),
+    )
+    parser.add_argument("prompt", nargs="?", help="initial prompt (passed as claude -p PROMPT)")
+    parser.add_argument("--resume-prompt", default=DEFAULT_RESUME_PROMPT, metavar="TEXT",
+                        help="prompt sent upon auto-resume (default: %(default)s)")
+    parser.add_argument("--max-retries", type=_non_negative_int, default=DEFAULT_MAX_RETRIES,
+                        metavar="INT", help="maximum number of limit wait cycles (default: %(default)s)")
+    parser.add_argument("--fallback-wait", type=_non_negative_int, default=DEFAULT_FALLBACK_WAIT,
+                        metavar="INT", help="seconds to wait if the reset time cannot be parsed (default: %(default)s)")
+    parser.add_argument("--buffer-sec", type=_non_negative_int, default=DEFAULT_BUFFER_SEC,
+                        metavar="INT", help="extra seconds added after the reset time (default: %(default)s)")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--stdin", action="store_true",
+                        help="read the initial prompt from stdin (keeps it out of process arguments)")
+    source.add_argument("--prompt-file", metavar="PATH",
+                        help="read the initial prompt from a UTF-8 file (keeps it out of process arguments)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="parse arguments and test lock acquisition without invoking claude")
+    parser.add_argument("--version", action="version", version=f"ccw {__version__}")
+    return parser
+
+
+# claude options that ccw manages itself and therefore must not appear after "--".
+RESERVED_CLAUDE_OPTIONS = ("-p", "--print", "-c", "--continue", "-r", "--resume")
+
+
+@dataclass
+class Options:
+    resume_prompt: str
+    max_retries: int
+    fallback_wait: int
+    buffer_sec: int
+    dry_run: bool
+    claude_args: list[str]       # extra claude options, used on every run
+    prompt: str | None           # positional prompt, passed in argv
+    initial_stdin: str | None    # --stdin / --prompt-file prompt, piped to stdin
+    prompt_source: str
+
+    # "-p" always comes after claude_args so that a variadic option such as
+    # --allowedTools cannot swallow the prompt. ``placeholder`` replaces the
+    # prompt text for display (dry run) so it is never echoed.
+
+    def initial_args(self, placeholder: str | None = None) -> list[str]:
+        args = [*self.claude_args, "-p"]
+        if self.prompt is not None:
+            args.append(self.prompt if placeholder is None else placeholder)
+        return args
+
+    def resume_args(self, placeholder: str | None = None) -> list[str]:
+        prompt = self.resume_prompt if placeholder is None else placeholder
+        return [*self.claude_args, "--continue", "-p", prompt]
+
+
+def _check_claude_args(args: Sequence[str]) -> None:
+    for arg in args:
+        name = arg.split("=", 1)[0] if arg.startswith("--") else arg
+        if name in RESERVED_CLAUDE_OPTIONS:
+            raise UsageError(
+                f"{arg!r} is managed by ccw and cannot be passed after --; "
+                "give the prompt to ccw itself (\"<prompt>\", --stdin or --prompt-file)"
+            )
+
+
+def _read_stdin_text(stream: TextIO) -> str:
+    buffer = getattr(stream, "buffer", None)
+    if buffer is None:
+        return stream.read()
+    data = buffer.read()
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode(getattr(stream, "encoding", None) or "utf-8", errors="replace")
+
+
+def parse_options(argv: Sequence[str], stdin: TextIO) -> Options:
+    argv = list(argv)
+    raw: list[str] | None = None
+    if "--" in argv:
+        idx = argv.index("--")
+        argv, raw = argv[:idx], argv[idx + 1:]
+
+    ns = build_parser().parse_args(argv)
+
+    sources = [
+        name
+        for name, used in (
+            ("prompt", ns.prompt is not None),
+            ("--stdin", ns.stdin),
+            ("--prompt-file", ns.prompt_file is not None),
+        )
+        if used
+    ]
+    if not sources:
+        raise UsageError('no prompt given (use "<prompt>", --stdin or --prompt-file)')
+    if len(sources) > 1:
+        raise UsageError(f"only one prompt source is allowed, got: {', '.join(sources)}")
+    if not ns.resume_prompt.strip():
+        raise UsageError("--resume-prompt must not be empty")
+
+    claude_args: list[str] = []
+    if raw is not None:
+        if not raw:
+            raise UsageError("no claude options after --")
+        _check_claude_args(raw)
+        claude_args = list(raw)
+
+    initial_stdin: str | None = None
+    source = sources[0]
+    if source == "prompt":
+        if not ns.prompt.strip():
+            raise UsageError("prompt must not be empty")
+    else:
+        if source == "--stdin":
+            text = _read_stdin_text(stdin)
+        else:
+            try:
+                with open(ns.prompt_file, encoding="utf-8-sig") as fh:
+                    text = fh.read()
+            except (OSError, UnicodeDecodeError) as exc:
+                raise UsageError(f"cannot read --prompt-file: {exc}") from exc
+        if not text.strip():
+            raise UsageError(f"prompt from {source} is empty")
+        initial_stdin = text
+
+    return Options(
+        resume_prompt=ns.resume_prompt,
+        max_retries=ns.max_retries,
+        fallback_wait=ns.fallback_wait,
+        buffer_sec=ns.buffer_sec,
+        dry_run=ns.dry_run,
+        claude_args=claude_args,
+        prompt=ns.prompt,
+        initial_stdin=initial_stdin,
+        prompt_source=source,
+    )
+
+
+# --------------------------------------------------------------------------
+# Main loop
+# --------------------------------------------------------------------------
+
+
+class _Terminated(KeyboardInterrupt):
+    """Raised from signal handlers so the Ctrl+C cleanup path runs."""
+
+
+def _raise_terminated(signum: int, frame: object) -> None:
+    raise _Terminated()
+
+
+# Signals that end ccw through the same path as Ctrl+C. SIGHUP is sent when
+# the terminal is closed (POSIX); SIGBREAK is Ctrl+Break (Windows).
+TERMINATING_SIGNALS = ("SIGTERM", "SIGHUP", "SIGBREAK")
+
+# Windows console control events that end the process and cannot be ignored.
+CTRL_CLOSE_EVENT = 2
+CTRL_LOGOFF_EVENT = 5
+CTRL_SHUTDOWN_EVENT = 6
+_CONSOLE_END_EVENTS = (CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT)
+
+
+class _Cleanup:
+    """Stops the child and removes the lock, at most once.
+
+    Shared by the normal exit path and the Windows console handler, which
+    runs on a separate thread.
+    """
+
+    def __init__(self, runner: ChildRunner) -> None:
+        self.runner = runner
+        self.lock_path: str | None = None
+        self._guard = threading.Lock()
+        self._done = False
+
+    def run(self, wait_for_child: bool = True) -> None:
+        with self._guard:
+            if self._done:
+                return
+            self._done = True
+        self.runner.terminate(wait=wait_for_child)
+        release_lock(self.lock_path)
+
+
+def _console_ctrl_handler(ctrl_type: int, cleanup: _Cleanup) -> bool:
+    """Handle a Windows console control event; return True if handled.
+
+    Closing the console window, logging off and shutting down cannot be
+    caught as Python signals, and Windows kills the process a few seconds
+    after this handler returns, so clean up right here without waiting for
+    the child. Ctrl+C / Ctrl+Break are left to Python's own handlers.
+    """
+    if ctrl_type not in _CONSOLE_END_EVENTS:
+        return False
+    cleanup.run(wait_for_child=False)
+    return True
+
+
+def _install_console_handler(cleanup: _Cleanup) -> Callable[[], None] | None:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except (ImportError, OSError, AttributeError):
+        return None
+    handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    @handler_type
+    def handler(ctrl_type: int) -> bool:
+        try:
+            return _console_ctrl_handler(int(ctrl_type), cleanup)
+        except BaseException:
+            return False
+
+    set_handler = kernel32.SetConsoleCtrlHandler
+    set_handler.argtypes = [handler_type, wintypes.BOOL]
+    set_handler.restype = wintypes.BOOL
+    if not set_handler(handler, True):
+        return None
+
+    def restore() -> None:
+        set_handler(handler, False)  # the closure also keeps the callback alive
+
+    return restore
+
+
+def _install_handlers(cleanup: _Cleanup) -> Callable[[], None]:
+    """Install termination handlers; return a function that restores them."""
+    restores: list[Callable[[], None]] = []
+    for name in TERMINATING_SIGNALS:
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            previous = signal.signal(signum, _raise_terminated)
+        except (ValueError, OSError):  # not in the main thread / unsupported
+            continue
+        if previous is None:
+            previous = signal.SIG_DFL
+        restores.append(lambda signum=signum, previous=previous: signal.signal(signum, previous))
+    if os.name == "nt":
+        restore_console = _install_console_handler(cleanup)
+        if restore_console is not None:
+            restores.append(restore_console)
+
+    def restore_all() -> None:
+        for restore in reversed(restores):
+            with contextlib.suppress(ValueError, OSError, TypeError):
+                restore()
+
+    return restore_all
+
+
+def _format_duration(seconds: float) -> str:
+    total = round(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+
+
+def wait_until(
+    target: datetime,
+    now_fn: Callable[[], datetime],
+    sleep_fn: Callable[[float], None],
+    log: Callable[[str], None],
+) -> None:
+    """Sleep until wall-clock ``target`` (robust to system suspend)."""
+    while True:
+        remaining = (target - now_fn()).total_seconds()
+        if remaining <= 0:
+            return
+        log(f"waiting for limit reset: {_format_duration(remaining)} remaining "
+            f"(resume at {target.isoformat(timespec='seconds')})")
+        sleep_fn(min(remaining, STATUS_INTERVAL_SEC))
+
+
+def _wants_utf8(
+    stream: TextIO,
+    environ: Mapping[str, str] | None = None,
+    is_windows: bool | None = None,
+) -> bool:
+    """Whether to force UTF-8 on ``stream``.
+
+    On Windows, Python writes to pipes and files in the ANSI code page
+    (cp932 on Japanese systems). Git Bash (mintty) reads its pipe as UTF-8,
+    and cp932 cannot represent many characters claude prints (emoji, ...),
+    so they would be garbled or lost. The real console is written with
+    Unicode APIs regardless of encoding, so it is left alone, and an
+    explicit PYTHONIOENCODING always wins.
+    """
+    if environ is None:
+        environ = os.environ
+    if is_windows is None:
+        is_windows = os.name == "nt"
+    if not is_windows or environ.get("PYTHONIOENCODING"):
+        return False
+    try:
+        return not stream.isatty()
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _prepare_stream(stream: TextIO) -> None:
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+        return
+    options = {"errors": "replace"}
+    if _wants_utf8(stream):
+        options["encoding"] = "utf-8"
+    with contextlib.suppress(ValueError, OSError):
+        reconfigure(**options)
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    claude_cmd: Sequence[str] | None = None,
+    cwd: str | None = None,
+    stdin: TextIO | None = None,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+    now_fn: Callable[[], datetime] = datetime.now,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    stdin = sys.stdin if stdin is None else stdin
+    stdout = sys.stdout if stdout is None else stdout
+    stderr = sys.stderr if stderr is None else stderr
+    _prepare_stream(stdout)
+    _prepare_stream(stderr)
+    cwd = os.getcwd() if cwd is None else cwd
+
+    def log(message: str) -> None:
+        stderr.write(f"[ccw] {message}\n")
+        stderr.flush()
+
+    # INIT -----------------------------------------------------------------
+    try:
+        opts = parse_options(argv, stdin)
+    except UsageError as exc:
+        log(f"error: {exc}")
+        return EXIT_USAGE
+
+    if claude_cmd is None:
+        try:
+            claude_cmd = resolve_claude_command()
+        except ClaudeNotFoundError as exc:
+            if not opts.dry_run:
+                log(f"error: {exc}")
+                return EXIT_USAGE
+            log(f"warning: {exc}")
+            claude_cmd = ["claude"]
+    base_cmd = list(claude_cmd)
+
+    runner = ChildRunner(stdout)
+    cleanup = _Cleanup(runner)
+    restore_handlers = _install_handlers(cleanup)
+    try:
+        try:
+            cleanup.lock_path = acquire_lock(cwd)
+        except LockError as exc:
+            log(f"error: {exc}")
+            return EXIT_LOCKED
+
+        if opts.dry_run:
+            log(f"dry run: lock acquired at {cleanup.lock_path}")
+            log(f"dry run: would run {base_cmd + opts.initial_args('<prompt>')!r} "
+                f"(prompt source: {opts.prompt_source})")
+            log(f"dry run: resume with {base_cmd + opts.resume_args('<resume prompt>')!r}")
+            return EXIT_OK
+
+        retry_count = 0
+        cmd = base_cmd + opts.initial_args()
+        stdin_text = opts.initial_stdin
+        while True:
+            # RUNNING_INITIAL / RUNNING_RESUME --------------------------------
+            try:
+                rc, lines = runner.run(cmd, stdin_text)
+            except OSError as exc:
+                log(f"error: failed to start claude: {exc}")
+                return EXIT_USAGE
+
+            # EVALUATING_OUTPUT -----------------------------------------------
+            if rc == EXIT_INTERRUPTED:
+                # Ctrl+C / Ctrl+Break reached claude first; ccw's own handler
+                # may not have run yet. Never resume after an interruption.
+                log("interrupted")
+                return EXIT_INTERRUPTED
+            now = now_fn()
+            info = detect_limit(list(lines), now)
+            if not info.detected:
+                if rc == 0:
+                    return EXIT_OK
+                log(f"claude exited with code {rc}")
+                return rc
+
+            log(f"session limit detected: {info.raw_line}")
+            if retry_count >= opts.max_retries:
+                log(f"giving up after {retry_count} wait cycle(s) (--max-retries {opts.max_retries})")
+                return EXIT_MAX_RETRIES
+
+            # WAITING_RESET ---------------------------------------------------
+            seconds = compute_wait_seconds(info, now, opts.buffer_sec, opts.fallback_wait)
+            if info.reset_at is None:
+                log(f"reset time not found; using fallback wait of {opts.fallback_wait}s")
+            wait_until(now + timedelta(seconds=seconds), now_fn, sleep_fn, log)
+
+            retry_count += 1
+            log(f"resuming session ({retry_count}/{opts.max_retries})")
+            cmd = base_cmd + opts.resume_args()
+            stdin_text = None
+    except KeyboardInterrupt:
+        log("interrupted")
+        return EXIT_INTERRUPTED
+    finally:
+        # CLEANUP -------------------------------------------------------------
+        cleanup.run()
+        restore_handlers()
+
+
+def _entry() -> int:
+    """Script entry point: an interruption always exits with 130.
+
+    A Ctrl+C / Ctrl+Break / SIGTERM can arrive late, e.g. after claude has
+    already exited and ``main()`` is cleaning up or restoring its handlers.
+    Keeping our handlers installed around ``main()`` turns such a signal into
+    a KeyboardInterrupt caught here, instead of a traceback or a kill by the
+    default handler.
+    """
+    for name in TERMINATING_SIGNALS:
+        signum = getattr(signal, name, None)
+        if signum is not None:
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(signum, _raise_terminated)
+    try:
+        return main()
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+
+
+if __name__ == "__main__":
+    sys.exit(_entry())

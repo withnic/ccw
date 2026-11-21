@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.py text eol=lf
+ccw text eol=lf
+# Windows batch files need CRLF
+*.cmd text eol=crlf

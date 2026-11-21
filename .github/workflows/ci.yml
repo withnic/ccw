@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          # No dependency files to key a cache on; ruff alone downloads in a second or two.
+          enable-cache: false
+
+      # ccw has no extension, so list the files explicitly.
+      - name: ruff check
+        run: uvx ruff@0.17.6 check --output-format=github ccw test_ccw.py
+
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS minutes count 10x on private repositories, so pull requests test
+        # Linux + Windows only; pushes to main and manual runs add macOS.
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest", "windows-latest"]' || '["ubuntu-latest", "windows-latest", "macos-latest"]') }}
+        python: ["3.x"]
+        include:
+          # Python 3.8 (the supported floor). ubuntu-latest (26.04) and macOS arm64 have
+          # no 3.8 build, so use ubuntu-24.04. When ubuntu-24.04 runners are retired,
+          # install 3.8 with `uv python install 3.8` instead.
+          - os: ubuntu-24.04
+            python: "3.8"
+          - os: windows-latest
+            python: "3.8"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Show Python version
+        run: python --version
+
+      - name: Compile
+        run: python -m py_compile ccw test_ccw.py
+
+      - name: Unit tests
+        run: python -m unittest -v test_ccw.py
+
+      - name: Executable bit and shebang (POSIX)
+        if: runner.os != 'Windows'
+        run: |
+          test -x ccw || { echo "::error file=ccw::ccw is not executable (git add --chmod=+x ccw)"; exit 1; }
+          ./ccw --version
