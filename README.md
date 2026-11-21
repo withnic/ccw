@@ -103,7 +103,10 @@ PowerShell decodes piped output with `[Console]::OutputEncoding` (often the lega
   ```sh
   ccw "..." -- --allowedTools "Bash(python3 -m unittest *)" "Bash(git commit *)"
   ```
-- **Keep `git push` denied.** Review the commits when the run is done and push them yourself.
+- **Make `git push` ask.** In `-p` runs nobody can answer, so an `ask` rule is denied and nothing is pushed while you are away. In an interactive session you get a prompt and can check the commits first. Rules match the start of the command, so `git -C <path> push` slips past `Bash(git push *)`. Cover the `-C` and `-c` forms too:
+  ```json
+  "ask": ["Bash(git push *)", "Bash(git -C *)", "Bash(git -c *)"]
+  ```
 - **Permission rules are not a sandbox.** They match command strings. Allowing "run the tests" (or `npm run`, `make`, ...) lets claude run any code it writes into those files. Deny rules such as `Bash(rm -rf *)` are easy to sidestep (`rm -fr`, a script, ...).
 - **Use Claude Code's sandbox when you can (recommended).** It confines the shell commands claude runs, and everything they start, at the OS level: writes only to the working directory and temp, and network only to the domains you allow.
   - Available on macOS, Linux and WSL2. **Not on native Windows**, so run unattended jobs in WSL2.
