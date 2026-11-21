@@ -95,6 +95,25 @@ PowerShell decodes piped output with `[Console]::OutputEncoding` (often the lega
 - With `--stdin` / `--prompt-file`, the prompt is piped to claude's stdin and never appears in any process's argument list.
 - The lock file `.ccw.lock` is created exclusively, with `0600` permissions on POSIX. `ccw` refuses symlinks and only removes its own lock. The lock is removed on Ctrl+C and when the terminal window is closed; a lock left behind by a crash is cleaned up on the next start. Add `.ccw.lock` to your global gitignore (`~/.config/git/ignore`).
 
+## Running unattended
+
+`ccw` runs claude with `-p`, so nobody is there to answer permission prompts. **Anything your settings do not allow is denied without asking**, and claude works around it or stops. Decide up front what the task may do.
+
+- **Allow what the task needs.** Typically: reading and editing files, running the tests, `git add` / `git commit`. Use your Claude Code settings (`~/.claude/settings.json` or the project's `.claude/settings.json`), or allow tools for one run after `--`:
+  ```sh
+  ccw "..." -- --allowedTools "Bash(python3 -m unittest *)" "Bash(git commit *)"
+  ```
+- **Keep `git push` denied.** Review the commits when the run is done and push them yourself.
+- **Permission rules are not a sandbox.** They match command strings. Allowing "run the tests" (or `npm run`, `make`, ...) lets claude run any code it writes into those files. Deny rules such as `Bash(rm -rf *)` are easy to sidestep (`rm -fr`, a script, ...).
+- **Use Claude Code's sandbox when you can (recommended).** It confines the shell commands claude runs, and everything they start, at the OS level: writes only to the working directory and temp, and network only to the domains you allow.
+  - Available on macOS, Linux and WSL2. **Not on native Windows**, so run unattended jobs in WSL2.
+  - On Linux / WSL2, install `bubblewrap` and `socat` first (e.g. `sudo apt-get install bubblewrap socat`), then check with `/sandbox` inside `claude`.
+  - Set `"allowUnsandboxedCommands": false` (no retry outside the sandbox) and `"failIfUnavailable": true` (refuse to start instead of running unsandboxed).
+  - Network starts closed. Add `sandbox.network.allowedDomains` for what the task needs, such as a package registry.
+- **Protect your settings and hooks.** Deny `Edit(...)` on `~/.claude/settings.json` and on your git hooks so claude cannot loosen its own limits. `Edit` rules cover every file-editing tool. `Write(...)` rules are ignored for files.
+
+[`examples/claude-settings.json`](examples/claude-settings.json) is a starting point with these settings. Copy what you need into your own settings and adjust it as you go.
+
 ## Development
 
 ```sh
