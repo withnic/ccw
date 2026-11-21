@@ -26,6 +26,11 @@
       "Bash(git worktree add *)",
       "Bash(git worktree list*)"
     ],
+    "ask": [
+      "Bash(git push *)",
+      "Bash(git -C *)",
+      "Bash(git -c *)"
+    ],
     "deny": [
       "Read(.env)",
       "Read(.env.*)",
@@ -36,7 +41,6 @@
       "Read(~/.aws/*)",
       "Edit(~/.claude/settings.json)",
       "Edit(**/.git/hooks/**)",
-      "Bash(git push *)",
       "Bash(git reset --hard *)",
       "Bash(git commit --no-verify*)",
       "Bash(git commit * --no-verify*)",
