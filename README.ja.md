@@ -95,6 +95,25 @@ PowerShell は、パイプで受け取った出力を `[Console]::OutputEncoding
 - `--stdin` / `--prompt-file` を使うと、プロンプトは claude の標準入力に流すので、どのプロセスの引数にも現れません。
 - ロックファイル `.ccw.lock` は排他的に作成し、POSIX では権限を `0600` にします。シンボリックリンクは拒否し、自分で作ったロックだけを消します。Ctrl+C で止めたときやターミナルを閉じたときにもロックを消します。異常終了で残ったロックは、次に起動したときに片付けます。`.ccw.lock` はグローバルの gitignore（`~/.config/git/ignore`）に追加しておいてください。
 
+## 任せきりで動かすとき
+
+`ccw` は claude を `-p` で動かすので、「実行していいですか？」に答える人がいません。**設定で許可していない操作は、聞かれずに拒否されます。** claude はそれを避けて進めるか、そこで止まります。何をさせてよいかを、先に決めておいてください。
+
+- **作業に必要なものを許可する。** ファイルを読む・編集する、テストを実行する、`git add` / `git commit` あたりが基本です。Claude Code の設定（`~/.claude/settings.json` か、プロジェクトの `.claude/settings.json`）に書くか、その回だけ `--` の後ろで許可します。
+  ```sh
+  ccw "..." -- --allowedTools "Bash(python3 -m unittest *)" "Bash(git commit *)"
+  ```
+- **`git push` は禁止のままにする。** 終わったらコミットを確かめて、自分で push してください。
+- **permissions はサンドボックスではない。** 規則はコマンドの文字列で判定します。「テストを実行してよい」（`npm run` や `make` なども同じ）を許可すると、claude はテストのファイルに書いた、どんなコードでも実行できます。`Bash(rm -rf *)` のような禁止も、`rm -fr` やスクリプトを使えば簡単にすり抜けられます。
+- **できれば、Claude Code のサンドボックスを使う（推奨）。** claude が実行するシェルのコマンドと、そこから起動したものすべてを、OS のレベルで閉じ込めます。書き込めるのは作業中のフォルダと temp だけ、通信できるのは許可したドメインだけになります。
+  - 使えるのは macOS、Linux、WSL2 です。**Windows では使えない**ので、任せきりの作業は WSL2 で動かしてください。
+  - Linux / WSL2 では、先に `bubblewrap` と `socat` を入れます（例: `sudo apt-get install bubblewrap socat`）。そのあと `claude` の中で `/sandbox` を開いて確かめます。
+  - `"allowUnsandboxedCommands": false`（囲いの外でやり直させない）と `"failIfUnavailable": true`（囲いが使えないときは、囲いなしで動かさずに起動を止める）にしておきます。
+  - 通信は、最初はすべて閉じています。パッケージのリポジトリなど、作業に必要なものだけ `sandbox.network.allowedDomains` に足します。
+- **設定と hook を守る。** `~/.claude/settings.json` と git の hook に、`Edit(...)` の禁止を入れておきます。claude が自分の制限をゆるめられないようにするためです。`Edit` の規則は、ファイルを書き換えるすべての道具に効きます。`Write(...)` の規則は、ファイルには効きません。
+
+[`examples/claude-settings.json`](examples/claude-settings.json) は、これらをまとめた設定の見本です。必要なところを自分の設定に写して、使いながら調整してください。
+
 ## 開発
 
 ```sh
