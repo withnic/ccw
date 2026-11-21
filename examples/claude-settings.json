@@ -13,6 +13,7 @@
       "Bash(head *)",
       "Bash(tail *)",
       "Bash(wc *)",
+      "Bash(jq *)",
       "Bash(python3 -m unittest *)",
       "Bash(python3 -m pytest *)",
       "Bash(npm test *)",
