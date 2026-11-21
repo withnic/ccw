@@ -1,0 +1,14 @@
+# ruff is a development-only tool (run via `uvx ruff`); ccw itself stays dependency-free.
+target-version = "py38"
+line-length = 120
+
+[lint]
+select = [
+  "F",    # pyflakes: undefined names, unused imports
+  "E",    # pycodestyle errors
+  "W",    # pycodestyle warnings
+  "B",    # flake8-bugbear: likely bugs
+  "UP",   # pyupgrade: modern syntax valid for py38
+  "SIM",  # flake8-simplify
+  "I",    # isort: import order
+]

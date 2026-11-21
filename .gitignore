@@ -1,0 +1,6 @@
+docs/
+__pycache__/
+*.py[cod]
+.ccw.lock
+.claude/settings.local.json
+.ruff_cache/
