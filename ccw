@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Mapping, NoReturn, Sequence, TextIO
@@ -61,6 +62,33 @@ OUTPUT_BUFFER_LINES = 200
 DETECT_TAIL_LINES = 5
 STATUS_INTERVAL_SEC = 60.0
 TERMINATE_TIMEOUT_SEC = 5.0
+
+# Headless progress display (stream-json events + in-place status line) -------
+STREAM_JSON_ARGS = ("--output-format", "stream-json")
+VERBOSE_ARG = "--verbose"        # claude requires it for stream-json with -p
+PROGRESS_INTERVAL_SEC = 0.5      # redraw interval of the spinner line
+COUNTDOWN_INTERVAL_SEC = 1.0     # step of the in-place countdown while waiting for a reset
+SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+THINKING_STATUS = "Claude is thinking..."
+TOOL_TARGET_MAX = 200
+# Input keys tried, in order, for the target shown next to a tool's name.
+_TOOL_TARGET_KEYS = {
+    "Read": ("file_path",),
+    "Edit": ("file_path",),
+    "MultiEdit": ("file_path",),
+    "Write": ("file_path",),
+    "NotebookEdit": ("notebook_path", "file_path"),
+    "Bash": ("command",),
+    "Grep": ("pattern",),
+    "Glob": ("pattern",),
+    "WebFetch": ("url",),
+    "WebSearch": ("query",),
+    "Task": ("description",),
+    "Agent": ("description",),
+}
+_GENERIC_TARGET_KEYS = ("file_path", "path", "notebook_path", "command", "pattern", "url", "query",
+                        "description")
+_PATH_KEYS = ("file_path", "path", "notebook_path")
 
 ENV_CLAUDE_CMD = "CCW_CLAUDE_CMD"
 _CLAUDE_PKG_PARTS = ("node_modules", "@anthropic-ai", "claude-code")
@@ -734,15 +762,305 @@ def resolve_claude_command(
 # --------------------------------------------------------------------------
 
 
+def parse_stream_event(line: str) -> dict[str, object] | None:
+    """The stream-json event on ``line``, or None if it is plain text.
+
+    Only a JSON object with a string ``type`` is an event; anything else
+    (plain output, merged stderr, invalid JSON, a bare number) is text.
+    """
+    text = line.strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return None
+    if isinstance(obj, dict) and isinstance(obj.get("type"), str):
+        return obj
+    return None
+
+
+def _message_content(event: Mapping[str, object]) -> list[dict[str, object]]:
+    message = event.get("message")
+    if not isinstance(message, dict):
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]
+
+
+def iter_tool_uses(event: Mapping[str, object]) -> list[tuple[str, dict[str, object]]]:
+    """``(name, input)`` of every ``tool_use`` block of an assistant event."""
+    uses = []
+    for block in _message_content(event):
+        if block.get("type") != "tool_use":
+            continue
+        name = block.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        tool_input = block.get("input")
+        uses.append((name, tool_input if isinstance(tool_input, dict) else {}))
+    return uses
+
+
+def assistant_text(event: Mapping[str, object]) -> str:
+    """The text blocks of an assistant event, joined."""
+    parts = [block["text"] for block in _message_content(event)
+             if block.get("type") == "text" and isinstance(block.get("text"), str)]
+    return "".join(parts)  # type: ignore[arg-type]
+
+
+def result_text(event: Mapping[str, object]) -> str | None:
+    """The final answer of a ``result`` event (or its errors), if any."""
+    result = event.get("result")
+    if isinstance(result, str):
+        return result
+    errors = event.get("errors")
+    if isinstance(errors, list):
+        texts = [e for e in errors if isinstance(e, str)]
+        if texts:
+            return "\n".join(texts)
+    return None
+
+
+def _clean_status(text: str) -> str:
+    """One line, no escape sequences or control characters, secrets masked."""
+    return redact_secrets(" ".join(strip_ansi(text).split()))
+
+
+def describe_tool_use(name: str, tool_input: Mapping[str, object], cwd: str | None = None) -> str:
+    """``"Edit: ccw"``-style status text for a tool call (redacted)."""
+    keys = _TOOL_TARGET_KEYS.get(name, _GENERIC_TARGET_KEYS)
+    for key in keys:
+        value = tool_input.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        if key in _PATH_KEYS and cwd:
+            with contextlib.suppress(ValueError):  # another drive on Windows
+                rel = os.path.relpath(value, cwd)
+                if not rel.startswith(".."):
+                    value = rel
+        target = _clean_status(value)
+        if len(target) > TOOL_TARGET_MAX:
+            target = target[:TOOL_TARGET_MAX - 3] + "..."
+        return f"{_clean_status(name)}: {target}"
+    return _clean_status(name)
+
+
+def _char_width(ch: str) -> int:
+    # Ambiguous characters are wide in CJK terminals; count them as 2 so the
+    # line never wraps.
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F", "A") else 1
+
+
+def display_width(text: str) -> int:
+    return sum(_char_width(ch) for ch in text)
+
+
+def fit_width(text: str, width: int) -> str:
+    """Cut ``text`` to at most ``width`` terminal columns (``...`` marks a cut)."""
+    if display_width(text) <= width:
+        return text
+    if width <= 3:
+        return "." * max(0, width)
+    out, used = [], 0
+    for ch in text:
+        w = _char_width(ch)
+        if used + w > width - 3:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "..."
+
+
+def _stream_isatty(stream: TextIO) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def progress_enabled(quiet: bool, stream: TextIO) -> bool:
+    """Draw the in-place status line only on a terminal and without ``--quiet``."""
+    return not quiet and _stream_isatty(stream)
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes:02d}m {secs:02d}s"
+
+
+def _format_remaining(seconds: float) -> str:
+    total = max(0, int(seconds + 0.999))  # never show 0s while time is left
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}h {minutes:02d}m {secs:02d}s"
+
+
+def countdown_text(target: datetime, now: datetime, remaining: float) -> str:
+    when = target.strftime("%H:%M") if target.date() == now.date() else target.strftime("%Y-%m-%d %H:%M")
+    return f"⏳ [ccw] Rate limit reached. Resuming at {when} ({_format_remaining(remaining)} remaining)..."
+
+
+class ProgressDisplay:
+    """One-line, in-place status on stderr (``\\r`` + overwrite).
+
+    When disabled every method is a no-op except ``paused()``, which then
+    only runs its body. All writes to the terminal by ccw go through
+    ``paused()`` so the status line is cleared first.
+    """
+
+    def __init__(
+        self,
+        stream: TextIO,
+        enabled: bool,
+        monotonic: Callable[[], float] = time.monotonic,
+        interval: float = PROGRESS_INTERVAL_SEC,
+    ) -> None:
+        self.stream = stream
+        self.enabled = enabled
+        self.monotonic = monotonic
+        self.interval = interval
+        self._lock = threading.RLock()
+        self._status = THINKING_STATUS
+        self._started = 0.0
+        self._frame = 0
+        self._drawn = 0           # columns currently covered by the status line
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # -- status ---------------------------------------------------------
+    @property
+    def status(self) -> str:
+        return self._status
+
+    def set_status(self, text: str) -> None:
+        with self._lock:
+            self._status = text or THINKING_STATUS
+
+    def line(self) -> str:
+        frame = SPINNER_FRAMES[self._frame % len(SPINNER_FRAMES)]
+        return f"{frame} [{_format_elapsed(self.monotonic() - self._started)}] {self._status}"
+
+    # -- spinner thread -------------------------------------------------
+    def start(self) -> None:
+        """Reset the elapsed time and status and start redrawing."""
+        with self._lock:
+            self._status = THINKING_STATUS
+            self._started = self.monotonic()
+            self._frame = 0
+        if not self.enabled or self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._spin, name="ccw-progress", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop redrawing and clear the line."""
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            self._stop.set()
+            thread.join(timeout=2.0)
+        self.clear()
+
+    def _spin(self) -> None:
+        while True:
+            self.tick()
+            if self._stop.wait(self.interval):
+                return
+
+    def tick(self) -> None:
+        with self._lock:
+            self.show(self.line())
+            self._frame += 1
+
+    # -- drawing --------------------------------------------------------
+    def _columns(self) -> int:
+        try:
+            columns = os.get_terminal_size(self.stream.fileno()).columns
+        except (AttributeError, ValueError, OSError):
+            columns = shutil.get_terminal_size().columns
+        return max(1, columns - 1)  # the last column would make some terminals wrap
+
+    def show(self, text: str) -> None:
+        """Draw ``text`` over the current status line."""
+        if not self.enabled:
+            return
+        with self._lock:
+            text = fit_width(text, self._columns())
+            width = display_width(text)
+            pad = max(0, self._drawn - width)
+            self._write("\r" + text + " " * pad)
+            self._drawn = width + pad
+
+    def clear(self) -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            if self._drawn:
+                self._write("\r" + " " * self._drawn + "\r")
+                self._drawn = 0
+
+    def _write(self, text: str) -> None:
+        with contextlib.suppress(OSError, ValueError):
+            self.stream.write(text)
+            self.stream.flush()
+
+    @contextlib.contextmanager
+    def paused(self):  # type: ignore[no-untyped-def]
+        """Clear the status line and keep it off while the body writes."""
+        with self._lock:
+            self.clear()
+            yield
+
+
 class ChildRunner:
     """Runs claude, streams redacted output and keeps a rolling buffer."""
 
-    def __init__(self, out: TextIO, env: Mapping[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        out: TextIO,
+        env: Mapping[str, str] | None = None,
+        progress: ProgressDisplay | None = None,
+        cwd: str | None = None,
+    ) -> None:
         self.out = out
         self.env = env
+        self.progress = progress
+        self.cwd = cwd
         self.proc: subprocess.Popen | None = None  # type: ignore[type-arg]
 
-    def run(self, cmd: Sequence[str], stdin_text: str | None = None) -> tuple[int, collections.deque[str]]:
+    def _emit(self, text: str) -> None:
+        if self.progress is None:
+            self.out.write(text)
+            self.out.flush()
+            return
+        with self.progress.paused():
+            self.out.write(text)
+            self.out.flush()
+
+    def _emit_block(self, text: str, redactor: Redactor, buffer: collections.deque[str]) -> None:
+        """Write a multi-line answer (redacted) and add its lines to the buffer."""
+        lines = text.splitlines(keepends=True)
+        if not lines:
+            return
+        if not lines[-1].endswith(("\n", "\r")):
+            lines[-1] += "\n"
+        masked = [redactor.redact(ln) for ln in lines]
+        self._emit("".join(masked))
+        buffer.extend(masked)
+
+    def run(
+        self,
+        cmd: Sequence[str],
+        stdin_text: str | None = None,
+        stream_json: bool = False,
+    ) -> tuple[int, collections.deque[str]]:
         env = dict(os.environ if self.env is None else self.env)
         env["PYTHONUTF8"] = "1"
         buffer: collections.deque[str] = collections.deque(maxlen=OUTPUT_BUFFER_LINES)
@@ -767,11 +1085,31 @@ class ChildRunner:
             feeder.start()
 
         assert proc.stdout is not None
+        got_result = False
+        last_text = ""
         for line in iter(proc.stdout.readline, ""):
-            masked = redactor.redact(line)
-            self.out.write(masked)
-            self.out.flush()
-            buffer.append(masked)
+            event = parse_stream_event(line) if stream_json else None
+            if event is None:
+                masked = redactor.redact(line)
+                self._emit(masked)
+                buffer.append(masked)
+                continue
+            kind = event["type"]
+            if kind == "assistant":
+                for name, tool_input in iter_tool_uses(event):
+                    if self.progress is not None:
+                        self.progress.set_status(describe_tool_use(name, tool_input, self.cwd))
+                text = assistant_text(event)
+                if text.strip():
+                    last_text = text
+            elif kind == "result":
+                text = result_text(event)
+                if text is not None:
+                    got_result = True
+                    self._emit_block(text, redactor, buffer)
+        if stream_json and not got_result and last_text:
+            # No result event (claude crashed or was killed): keep its last words.
+            self._emit_block(last_text, redactor, buffer)
         proc.stdout.close()
         rc = proc.wait()
         if feeder is not None:
@@ -1306,6 +1644,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="read the initial prompt from a UTF-8 file (keeps it out of process arguments)")
     parser.add_argument("--dry-run", action="store_true",
                         help="parse arguments and test lock acquisition without invoking claude")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="headless: do not show the spinner, tool status and reset countdown on stderr "
+                             "(they are only drawn when stderr is a terminal)")
     parser.add_argument("--version", action="version", version=f"ccw {__version__}")
     return parser
 
@@ -1329,20 +1670,36 @@ class Options:
     initial_stdin: str | None    # --stdin / --prompt-file prompt, piped to stdin
     prompt_source: str
     interactive: bool = False    # -i: TUI in a PTY, resume typed into the same session
+    quiet: bool = False          # -q: no in-place progress line (headless)
+
+    @property
+    def stream_json(self) -> bool:
+        """Whether ccw adds ``--output-format stream-json`` (and parses it)."""
+        if self.interactive:
+            return False
+        return not any(_option_name(arg) == "--output-format" for arg in self.claude_args)
+
+    def _output_args(self) -> list[str]:
+        if not self.stream_json:
+            return []
+        args = list(STREAM_JSON_ARGS)
+        if VERBOSE_ARG not in self.claude_args:
+            args.append(VERBOSE_ARG)
+        return args
 
     # "-p" always comes after claude_args so that a variadic option such as
     # --allowedTools cannot swallow the prompt. ``placeholder`` replaces the
     # prompt text for display (dry run) so it is never echoed.
 
     def initial_args(self, placeholder: str | None = None) -> list[str]:
-        args = [*self.claude_args, "-p"]
+        args = [*self.claude_args, *self._output_args(), "-p"]
         if self.prompt is not None:
             args.append(self.prompt if placeholder is None else placeholder)
         return args
 
     def resume_args(self, placeholder: str | None = None) -> list[str]:
         prompt = self.resume_prompt if placeholder is None else placeholder
-        return [*self.claude_args, "--continue", "-p", prompt]
+        return [*self.claude_args, *self._output_args(), "--continue", "-p", prompt]
 
     def interactive_args(self, placeholder: str | None = None) -> list[str]:
         # "--" ends claude's option parsing, so a variadic option such as
@@ -1353,10 +1710,14 @@ class Options:
         return args
 
 
+def _option_name(arg: str) -> str:
+    return arg.split("=", 1)[0] if arg.startswith("--") else arg
+
+
 def _check_claude_args(args: Sequence[str], interactive: bool = False) -> None:
     reserved = RESERVED_INTERACTIVE_OPTIONS if interactive else RESERVED_CLAUDE_OPTIONS
     for arg in args:
-        name = arg.split("=", 1)[0] if arg.startswith("--") else arg
+        name = _option_name(arg)
         if name in reserved:
             if interactive:
                 raise UsageError(f"{arg!r} cannot be used with --interactive (it runs claude's TUI)")
@@ -1443,6 +1804,7 @@ def parse_options(argv: Sequence[str], stdin: TextIO) -> Options:
         initial_stdin=initial_stdin,
         prompt_source=source,
         interactive=ns.interactive,
+        quiet=ns.quiet,
     )
 
 
@@ -1574,15 +1936,26 @@ def wait_until(
     now_fn: Callable[[], datetime],
     sleep_fn: Callable[[float], None],
     log: Callable[[str], None],
+    countdown: Callable[[datetime, datetime, float], None] | None = None,
 ) -> None:
-    """Sleep until wall-clock ``target`` (robust to system suspend)."""
+    """Sleep until wall-clock ``target`` (robust to system suspend).
+
+    Without ``countdown`` the remaining time is logged every minute; with it,
+    ``countdown(target, now, remaining)`` is called every second instead (the
+    in-place progress line).
+    """
     while True:
-        remaining = (target - now_fn()).total_seconds()
+        now = now_fn()
+        remaining = (target - now).total_seconds()
         if remaining <= 0:
             return
-        log(f"waiting for limit reset: {_format_duration(remaining)} remaining "
-            f"(resume at {target.isoformat(timespec='seconds')})")
-        sleep_fn(min(remaining, STATUS_INTERVAL_SEC))
+        if countdown is None:
+            log(f"waiting for limit reset: {_format_duration(remaining)} remaining "
+                f"(resume at {target.isoformat(timespec='seconds')})")
+            sleep_fn(min(remaining, STATUS_INTERVAL_SEC))
+        else:
+            countdown(target, now, remaining)
+            sleep_fn(min(remaining, COUNTDOWN_INTERVAL_SEC))
 
 
 def _wants_utf8(
@@ -1644,13 +2017,16 @@ def main(
     # Set while the terminal is in raw mode (interactive), where "\n" no
     # longer returns the carriage.
     raw_terminal = threading.Event()
+    # Headless in-place status line; enabled once the options are known.
+    progress = ProgressDisplay(stderr, enabled=False)
 
     def log(message: str) -> None:
-        if raw_terminal.is_set():
-            stderr.write(f"\r\n[ccw] {message}\r\n")
-        else:
-            stderr.write(f"[ccw] {message}\n")
-        stderr.flush()
+        with progress.paused():
+            if raw_terminal.is_set():
+                stderr.write(f"\r\n[ccw] {message}\r\n")
+            else:
+                stderr.write(f"[ccw] {message}\n")
+            stderr.flush()
 
     # INIT -----------------------------------------------------------------
     try:
@@ -1658,6 +2034,8 @@ def main(
     except UsageError as exc:
         log(f"error: {exc}")
         return EXIT_USAGE
+    progress.enabled = (not opts.interactive and not opts.dry_run
+                        and progress_enabled(opts.quiet, stderr))
 
     stdin_fd = stdout_fd = -1
     if opts.interactive and os.name == "nt":
@@ -1703,7 +2081,8 @@ def main(
     base_cmd = list(claude_cmd)
 
     runner: ChildRunner | PtyRunner = (
-        PtyRunner(stdin_fd, stdout_fd, raw_terminal) if opts.interactive else ChildRunner(stdout)
+        PtyRunner(stdin_fd, stdout_fd, raw_terminal) if opts.interactive
+        else ChildRunner(stdout, progress=progress, cwd=cwd)
     )
     cleanup = _Cleanup(runner)
     restore_handlers = _install_handlers(cleanup)
@@ -1751,11 +2130,14 @@ def main(
         stdin_text = opts.initial_stdin
         while True:
             # RUNNING_INITIAL / RUNNING_RESUME --------------------------------
+            progress.start()
             try:
-                rc, lines = runner.run(cmd, stdin_text)
+                rc, lines = runner.run(cmd, stdin_text, stream_json=opts.stream_json)
             except OSError as exc:
                 log(f"error: failed to start claude: {exc}")
                 return EXIT_USAGE
+            finally:
+                progress.stop()  # the status line is gone before any verdict is printed
 
             # EVALUATING_OUTPUT -----------------------------------------------
             if rc == EXIT_INTERRUPTED:
@@ -1780,7 +2162,14 @@ def main(
             seconds = compute_wait_seconds(info, now, opts.buffer_sec, opts.fallback_wait)
             if info.reset_at is None:
                 log(f"reset time not found; using fallback wait of {opts.fallback_wait}s")
-            wait_until(now + timedelta(seconds=seconds), now_fn, sleep_fn, log)
+            countdown = None
+            if progress.enabled:
+                def countdown(target: datetime, now: datetime, remaining: float) -> None:
+                    progress.show(countdown_text(target, now, remaining))
+            try:
+                wait_until(now + timedelta(seconds=seconds), now_fn, sleep_fn, log, countdown)
+            finally:
+                progress.clear()
 
             retry_count += 1
             log(f"resuming session ({retry_count}/{opts.max_retries})")
@@ -1791,6 +2180,7 @@ def main(
         return EXIT_INTERRUPTED
     finally:
         # CLEANUP -------------------------------------------------------------
+        progress.stop()
         cleanup.run()
         restore_handlers()
 

@@ -3,6 +3,8 @@
 ## Project Overview
 `ccw` is a zero-dependency, single-file Python CLI wrapper for Claude Code (`claude`). It runs `claude -p` headlessly, monitors the output for 5-hour session limit messages, calculates the reset timestamp, sleeps until the reset time, and automatically resumes with `claude <claude-options> --continue -p "<resume_prompt>"`. Options given after `--` are passed to claude on the initial run and on every resume.
 
+Headless runs add `--output-format stream-json --verbose` (unless the user passed `--output-format`), parse the JSON events, print only the final `result` text to stdout and show an in-place progress line on stderr (spinner, elapsed time, current tool; a countdown while waiting for the reset). The line is drawn only when stderr is a TTY and `-q` / `--quiet` is not given. Non-JSON lines fall back to plain pass-through.
+
 Interactive mode (`-i` / `--interactive`; PTY on POSIX) instead runs claude's normal TUI inside a pseudo-terminal that `ccw` proxies transparently (raw stdin, output, `SIGWINCH` window size). On a limit hit the same claude process is kept open; after the reset time `ccw` writes `resume_prompt` and then `"\r"` to the PTY master, once per limit hit. On native Windows (`os.name == "nt"`) `-i` is handed to ccw inside WSL2: `wsl.exe -e python3 <ccw as a WSL path> <same arguments>` in the same directory; only without `wsl.exe` does it exit `1`.
 
 ## Files
