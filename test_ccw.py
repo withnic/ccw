@@ -870,6 +870,357 @@ class TestOutputEncoding(unittest.TestCase):
         self.assertFalse(ccw._wants_utf8(object(), {}, is_windows=True))
 
 
+# --------------------------------------------------------------------------
+# 6. Interactive mode (-i)
+# --------------------------------------------------------------------------
+
+# A frame as a TUI draws it: erase/move the cursor, colors, a title (OSC) and
+# the limit message split by style changes.
+TUI_LIMIT_FRAME = (
+    "\x1b]0;✳ claude\x07"
+    "\x1b[2K\x1b[1A\x1b[2K\x1b[G"
+    "\x1b[38;2;215;119;87m⎿\x1b[39m  \x1b[1mClaude usage limit reached.\x1b[22m"
+    " Your limit will reset at \x1b[1m3pm\x1b[22m (Asia/Tokyo).\r\n"
+    "\x1b[2K\x1b[G╭──────────────╮\r\n"
+    "\x1b[2K\x1b[G│ > \x1b[7m \x1b[27m          │\r\n"
+    "\x1b[2K\x1b[G╰──────────────╯\x1b[?25h"
+)
+
+
+class TestAnsiStrip(unittest.TestCase):
+    def test_strip_removes_sequences_and_keeps_text(self):
+        text = ccw.strip_ansi("\x1b[31mred\x1b[0m plain \x1b]8;;https://x\x1b\\link\x1b]8;;\x1b\\\x1b(B\x07")
+        self.assertEqual(text, "red plain link")
+
+    def test_cursor_moves_separate_rows(self):
+        self.assertEqual(ccw.strip_ansi("one\x1b[1Btwo\x1b[3;1Hthree\x1b[2Cfour"), "one\ntwo\nthree four")
+
+    def test_limit_message_is_parsed_after_stripping(self):
+        lines = ccw.strip_ansi(TUI_LIMIT_FRAME).splitlines()
+        # The input box is drawn below the message, so the whole frame is inspected.
+        info = ccw.detect_limit(lines, NOW, tail_lines=None)
+        self.assertTrue(info.detected)
+        self.assertEqual(info.reset_at, datetime(2026, 11, 21, 15, 0))
+        self.assertNotIn("\x1b", info.raw_line)
+        self.assertIn("Claude usage limit reached. Your limit will reset at 3pm", info.raw_line)
+
+    def test_raw_text_does_not_parse_the_time(self):
+        # Without stripping, "\x1b[1m" sits between "at" and "3pm".
+        self.assertIsNone(ccw.parse_reset_time("reset at \x1b[1m3pm\x1b[22m", NOW))
+        self.assertEqual(ccw.parse_reset_time(ccw.strip_ansi("reset at \x1b[1m3pm\x1b[22m"), NOW),
+                         datetime(2026, 11, 21, 15, 0))
+
+
+class TestTerminalRedactor(unittest.TestCase):
+    def run_chunks(self, chunks):
+        r = ccw.TerminalRedactor()
+        return "".join(r.feed(c) for c in chunks) + r.flush()
+
+    def test_escape_sequences_untouched_and_width_kept(self):
+        raw = "\x1b[31mkey sk-ant-api03-AbCdEf0123456789\x1b[0m\x1b[5;10H"
+        out = self.run_chunks([raw])
+        self.assertNotIn("AbCdEf0123456789", out)
+        self.assertEqual(len(out), len(raw))
+        self.assertTrue(out.startswith("\x1b[31mkey sk-ant-****"))
+        self.assertTrue(out.endswith("\x1b[0m\x1b[5;10H"))
+
+    def test_secret_split_across_reads(self):
+        out = self.run_chunks(["token sk-ant-api03-Ab", "CdEf0123456789 done\x1b[0m"])
+        self.assertNotIn("CdEf0123456789", out)
+        self.assertIn("done\x1b[0m", out)
+
+    def test_escape_split_across_reads(self):
+        chunks = ["a\x1b[3", "1mb\x1b]0;ti", "tle\x07c"]
+        self.assertEqual(self.run_chunks(chunks), "".join(chunks))
+
+    def test_same_width_rules(self):
+        for text in ('AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG', '{"api_key": "abcdef123456"}',
+                     "Bearer eyJhbGciOiJIUzI1NiJ9.abc", "-----BEGIN PRIVATE KEY-----abc-----END PRIVATE KEY-----"):
+            with self.subTest(text=text):
+                out = ccw.redact_secrets_same_width(text)
+                self.assertEqual(len(out), len(text))
+                self.assertNotEqual(out, text)
+        self.assertEqual(ccw.redact_secrets_same_width("max_tokens: 1000"), "max_tokens: 1000")
+
+
+class TestAutoResumer(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock(NOW)
+        self.mono = 100.0
+        self.messages = []
+        self.resumer = self.make()
+
+    def make(self, max_retries=5):
+        return ccw.AutoResumer("続けて", max_retries, 15, 18000, self.clock.now, self.messages.append)
+
+    def advance(self, seconds):
+        self.mono += seconds
+        self.clock.current += timedelta(seconds=seconds)
+
+    def poll(self):
+        return self.resumer.poll(self.mono)
+
+    def hit_limit(self, frame=TUI_LIMIT_FRAME):
+        self.resumer.on_output(frame, self.mono)
+        self.advance(ccw.OUTPUT_SETTLE_SEC + 0.01)
+        self.assertEqual(self.poll(), b"")
+
+    def test_resume_prompt_sent_once_then_reset(self):
+        self.hit_limit()
+        self.assertEqual(self.resumer.state, "waiting")
+        self.assertEqual(self.resumer.target, datetime(2026, 11, 21, 15, 0, 15))
+        # Output during the wait (the TUI redrawing the same screen) changes nothing.
+        self.resumer.on_output(TUI_LIMIT_FRAME, self.mono)
+        self.advance(5 * 3600 + 14)
+        self.assertEqual(self.poll(), b"")  # 1 second before the target
+        self.advance(1)
+        self.assertEqual(self.poll(), "続けて".encode())
+        self.assertEqual(self.resumer.state, "submitting")
+        self.assertEqual(self.poll(), b"")  # "\r" only after the gap
+        self.advance(ccw.RESUME_SUBMIT_DELAY_SEC)
+        self.assertEqual(self.poll(), b"\r")
+        self.assertEqual(self.resumer.state, "watching")
+        self.assertEqual(self.resumer.retry_count, 1)
+        # A redraw of the transcript still shows the handled line: no second wait.
+        self.hit_limit()
+        self.assertEqual(self.resumer.state, "watching")
+        self.advance(10 * 3600)
+        self.assertEqual(self.poll(), b"")
+
+    def test_waits_for_user_to_stop_typing(self):
+        self.hit_limit()
+        self.advance(5 * 3600 + 15)
+        self.resumer.on_input(self.mono)
+        self.assertEqual(self.poll(), b"")
+        self.assertAlmostEqual(self.resumer.timeout(self.mono), ccw.INPUT_IDLE_SEC)
+        self.advance(ccw.INPUT_IDLE_SEC)
+        self.assertEqual(self.poll(), "続けて".encode())
+
+    def test_waits_for_output_to_settle(self):
+        self.resumer.on_output(TUI_LIMIT_FRAME, self.mono)
+        self.assertEqual(self.poll(), b"")
+        self.assertEqual(self.resumer.state, "watching")
+        self.assertAlmostEqual(self.resumer.timeout(self.mono), ccw.OUTPUT_SETTLE_SEC)
+
+    def test_new_limit_after_resume_is_detected(self):
+        self.hit_limit()
+        self.advance(5 * 3600 + 15)
+        self.assertEqual(self.poll(), "続けて".encode())
+        self.advance(1)
+        self.assertEqual(self.poll(), b"\r")
+        self.hit_limit("\x1b[1m5-hour limit reached ∙ resets 11pm\x1b[0m\r\n")
+        self.assertEqual(self.resumer.state, "waiting")
+
+    def test_fallback_wait(self):
+        self.hit_limit("\x1b[31musage limit reached\x1b[0m\r\n")
+        self.assertEqual(self.resumer.target, self.clock.now() + timedelta(seconds=18000))
+        self.assertTrue(any("fallback" in m for m in self.messages))
+
+    def test_max_retries_gives_up(self):
+        self.resumer = self.make(max_retries=0)
+        self.hit_limit()
+        self.assertTrue(self.resumer.gave_up)
+        self.advance(24 * 3600)
+        self.assertEqual(self.poll(), b"")
+        self.assertIsNone(self.resumer.timeout(self.mono))
+
+    def test_plain_output_is_ignored(self):
+        self.hit_limit("\x1b[32mAll tests passed\x1b[0m\r\n> ")
+        self.assertEqual(self.resumer.state, "watching")
+
+
+class TestInteractiveOptions(unittest.TestCase):
+    def parse(self, argv):
+        return ccw.parse_options(argv, io.StringIO(""))
+
+    def test_prompt_is_optional(self):
+        opts = self.parse(["-i"])
+        self.assertTrue(opts.interactive)
+        self.assertEqual(opts.interactive_args(), [])
+
+    def test_prompt_and_options(self):
+        opts = self.parse(["--interactive", "初回", "--", "--allowedTools", "Edit", "--continue"])
+        self.assertEqual(opts.interactive_args(), ["--allowedTools", "Edit", "--continue", "--", "初回"])
+
+    def test_print_rejected_and_stdin_sources_rejected(self):
+        for argv in (["-i", "--", "-p"], ["-i", "--", "--print"], ["-i", "--stdin"],
+                     ["-i", "--prompt-file", "x"], ["-i", "  "], ["-i", "--"]):
+            with self.subTest(argv=argv), self.assertRaises(ccw.UsageError):
+                self.parse(argv)
+
+    def test_headless_still_requires_prompt(self):
+        with self.assertRaises(ccw.UsageError):
+            self.parse([])
+
+    def test_dry_run(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(ccw, "interactive_unsupported_reason", return_value=None):
+            err = io.StringIO()
+            rc = ccw.main(["-i", "--dry-run", "secret", "--", "--model", "opus"], claude_cmd=["claude"],
+                          cwd=tmp, stdin=io.StringIO(), stdout=io.StringIO(), stderr=err)
+            self.assertFalse(os.path.exists(os.path.join(tmp, ".ccw.lock")))
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertIn("['claude', '--model', 'opus', '--', '<prompt>']", err.getvalue())
+        self.assertNotIn("secret", err.getvalue())
+
+
+class TestInteractiveWindows(unittest.TestCase):
+    EXPECTED = "Interactive mode (-i) requires a POSIX environment (WSL2 or macOS)"
+
+    def test_native_windows_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(ccw.os, "name", "nt"):
+                rc = ccw.main(["-i", "--", "--model", "opus"], claude_cmd=["claude"], cwd=tmp,
+                              stdin=io.StringIO(), stdout=out, stderr=err)
+            self.assertFalse(os.path.exists(os.path.join(tmp, ".ccw.lock")))
+        self.assertEqual(rc, 1)
+        self.assertIn(self.EXPECTED, err.getvalue())
+        self.assertIn("wsl ccw -i", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
+
+    @unittest.skipUnless(os.name == "nt", "native Windows only")
+    def test_native_windows_subprocess_has_no_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run(
+                [sys.executable, CCW_PATH, "--interactive"], cwd=tmp, capture_output=True,
+                text=True, encoding="utf-8", errors="replace", timeout=60, shell=False,
+            )
+            self.assertFalse(os.path.exists(os.path.join(tmp, ".ccw.lock")))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(self.EXPECTED, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+
+# A dummy TUI: raw mode, draws a limit message with ANSI codes, then records
+# what arrives on its stdin (expected: resume prompt + "\r", exactly once).
+DUMMY_TUI = textwrap.dedent(
+    r'''
+    import fcntl, json, os, select, struct, sys, termios, tty
+    def winsize():
+        rows, cols, _, _ = struct.unpack("HHHH", fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8))
+        return [rows, cols]
+    fd = sys.stdin.fileno()
+    first_size = winsize()
+    saved = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    received = b""
+    extra = b""
+    try:
+        os.write(1, b"\x1b[2J\x1b[H\x1b[1mWelcome\x1b[0m\r\n")
+        os.write(1, "\x1b[31m5-hour limit reached\x1b[0m ∙ resets in 0 minutes\r\n".encode())
+        os.write(1, b"\x1b[2K> \x1b[7m \x1b[27m")
+        while not received.endswith(b"\r"):
+            ready, _, _ = select.select([fd], [], [], 30)
+            if not ready:
+                break
+            received += os.read(fd, 1024)
+        while True:  # anything sent after the first "\r" would be a double send
+            ready, _, _ = select.select([fd], [], [], 1.5)
+            if not ready:
+                break
+            chunk = os.read(fd, 1024)
+            if not chunk:
+                break
+            extra += chunk
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+    with open(os.environ["MOCK_STATE"], "w", encoding="utf-8") as fh:
+        json.dump({"argv": sys.argv[1:], "received": received.decode("utf-8", "replace"),
+                   "extra": extra.decode("utf-8", "replace"), "isatty": os.isatty(fd),
+                   "first_size": first_size, "last_size": winsize()}, fh)
+    os.write(1, b"resumed ok\r\n")
+    '''
+)
+
+
+@unittest.skipIf(os.name == "nt", "PTY requires POSIX")
+class TestInteractivePty(unittest.TestCase):
+    def setUp(self):
+        try:
+            import pty  # noqa: F401
+        except ImportError:
+            self.skipTest("pty is not available")
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.work = os.path.join(self._tmp.name, "work")
+        os.mkdir(self.work)
+        self.state = os.path.join(self._tmp.name, "state.json")
+        dummy = os.path.join(self._tmp.name, "dummy_tui.py")
+        with open(dummy, "w", encoding="utf-8") as fh:
+            fh.write(DUMMY_TUI)
+        self.env = dict(os.environ)
+        self.env.update({"CCW_CLAUDE_CMD": json.dumps([sys.executable, dummy]), "MOCK_STATE": self.state})
+
+    def result(self):
+        with open(self.state, encoding="utf-8") as fh:
+            return json.load(fh)
+
+    def test_resume_prompt_typed_into_same_session(self):
+        args = ["-i", "--buffer-sec", "1", "--resume-prompt", "続けて", "初回", "--", "--model", "opus"]
+        proc = subprocess.run(
+            [sys.executable, CCW_PATH] + args, cwd=self.work, env=self.env, stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=60, shell=False,
+        )
+        stderr = proc.stderr.decode("utf-8", "replace")
+        self.assertEqual(proc.returncode, 0, stderr)
+        state = self.result()
+        self.assertTrue(state["isatty"])
+        self.assertEqual(state["argv"], ["--model", "opus", "--", "初回"])
+        self.assertEqual(state["received"], "続けて\r")
+        self.assertEqual(state["extra"], "")
+        stdout = proc.stdout.decode("utf-8", "replace")
+        self.assertIn("\x1b[31m5-hour limit reached\x1b[0m", stdout)  # TUI codes passed through
+        self.assertIn("resumed ok", stdout)
+        self.assertIn("session limit detected", stderr)
+        self.assertIn("resuming session (1/5)", stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.work, ".ccw.lock")))
+
+    def test_keyboard_raw_mode_and_window_size(self):
+        import fcntl
+        import pty
+        import select
+        import struct
+        import termios
+
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+        before = termios.tcgetattr(slave)
+        errfile = tempfile.TemporaryFile()  # noqa: SIM115 -- closed by addCleanup
+        self.addCleanup(errfile.close)
+        proc = subprocess.Popen(
+            # --buffer-sec 2: the keys below are typed before the resume is due.
+            [sys.executable, CCW_PATH, "-i", "--buffer-sec", "2", "--resume-prompt", "go"],
+            cwd=self.work, env=self.env, stdin=slave, stdout=subprocess.PIPE, stderr=errfile, shell=False,
+        )
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        output = b""
+        deadline = time.monotonic() + 30
+        while b"Welcome" not in output and time.monotonic() < deadline:
+            ready, _, _ = select.select([proc.stdout], [], [], 1)
+            if ready:
+                output += os.read(proc.stdout.fileno(), 4096)
+        self.assertIn(b"Welcome", output)
+        # The user types during the wait; the resume prompt waits for input to go idle.
+        os.write(master, b"hi\x1b[A")
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        proc.send_signal(signal.SIGWINCH)
+        output += proc.stdout.read()
+        rc = proc.wait(timeout=30)
+        errfile.seek(0)
+        self.assertEqual(rc, 0, errfile.read().decode("utf-8", "replace"))
+        state = self.result()
+        self.assertEqual(state["received"], "hi\x1b[Ago\r")
+        self.assertEqual(state["extra"], "")
+        self.assertEqual(state["first_size"], [30, 100])
+        self.assertEqual(state["last_size"], [40, 120])
+        self.assertEqual(termios.tcgetattr(slave), before)  # raw mode undone
+        self.assertFalse(os.path.exists(os.path.join(self.work, ".ccw.lock")))
+
+
 class TestSourceHygiene(unittest.TestCase):
     def test_ccw_is_lf_utf8_without_bom(self):
         with open(CCW_PATH, "rb") as fh:

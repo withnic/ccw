@@ -29,6 +29,7 @@ git clone https://github.com/withnic/ccw.git
 ```text
 ccw [ccw-options] "<initial prompt>"              [-- claude-options...]
 ccw [ccw-options] (--stdin | --prompt-file PATH)  [-- claude-options...]
+ccw -i [ccw-options] ["<initial prompt>"]          [-- claude-options...]
 ```
 
 ```sh
@@ -56,15 +57,16 @@ ccw --dry-run "Make all tests pass"
 | `--stdin` | | Read the initial prompt from stdin |
 | `--prompt-file PATH` | | Read the initial prompt from a UTF-8 file |
 | `--dry-run` | | Parse arguments and test the lock only |
+| `-i`, `--interactive` | | Keep claude's interactive TUI and type the resume prompt into the same session (see "Interactive mode" below) |
 
-Give the prompt to `ccw`, not after `--`. `-p`/`--print`, `-c`/`--continue` and `-r`/`--resume` are managed by `ccw` and are rejected after `--`.
+Give the prompt to `ccw`, not after `--`. `-p`/`--print`, `-c`/`--continue` and `-r`/`--resume` are managed by `ccw` and are rejected after `--` (with `-i`, only `-p`/`--print` is).
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Finished normally |
-| `1` | Invalid arguments, another `ccw` is running in this directory, or `claude` was not found |
+| `1` | Invalid arguments, another `ccw` is running in this directory, `claude` was not found, or `-i` on native Windows |
 | `2` | Still hitting the limit after `--max-retries` waits |
 | `130` | Interrupted (Ctrl+C, Ctrl+Break, SIGTERM, or the terminal was closed) |
 | other | `claude`'s own exit code |
@@ -77,6 +79,25 @@ Give the prompt to `ccw`, not after `--`. `-p`/`--print`, `-c`/`--continue` and 
 4. Resumes with `claude <claude-options> --continue -p "<resume prompt>"` and repeats from step 2.
 
 `ccw`'s own messages go to stderr with a `[ccw]` prefix.
+
+## Interactive mode (`-i` / `--interactive`, WSL2 and macOS only)
+
+Use claude's normal interactive TUI. When the 5-hour limit hits, `ccw` types the resume prompt into the same claude screen for you.
+
+```sh
+ccw -i                                    # start claude's TUI
+ccw -i "Make all tests pass"              # with an initial prompt
+ccw -i -- --model opus --continue         # claude options (--continue / --resume are allowed here)
+```
+
+- `ccw` starts claude in a pseudo-terminal (PTY) and passes your keys (arrows, Esc, Ctrl+C, Shift+Tab, ...) and the screen output straight through. Window resizes reach claude as well.
+- On the limit message claude is not stopped. `ccw` waits until the reset time (plus `--buffer-sec`), then types `--resume-prompt` and Enter. It sends this once per limit hit.
+- You can keep typing while it waits. The prompt is only sent after your input has been idle for 2 seconds. Text left in the input box is sent together with the resume prompt.
+- `--max-retries`, `--fallback-wait` and `--dry-run` work as usual. `--stdin` / `--prompt-file` are not available.
+- If the limit hits again after `--max-retries` resumes, auto-resume stops. claude stays open, and `ccw` exits with `2` when you quit it. Otherwise `ccw` returns claude's own exit code.
+- The TUI draws its input box below the limit message, so every new line is checked, not just the last few. A limit phrase in claude's own reply can therefore start a wait. The `[ccw]` message shows which line matched.
+- Secrets are masked with the same number of `*` so the screen layout stays intact. A secret split by color codes, or a multi-line private key, is not masked in this mode.
+- Not available on native Windows (the standard library has no PTY there). Use WSL2 (`wsl ccw -i`) or the headless mode.
 
 ### Output encoding on Windows
 
