@@ -5,11 +5,16 @@ Runs ``claude -p`` headlessly, watches its output for the 5-hour session
 limit message, sleeps until the limit resets and resumes the same
 directory-scoped session with ``claude --continue -p "<resume prompt>"``.
 
+With ``-i`` / ``--interactive`` (PTY on POSIX, WSL2 from native Windows) claude's normal TUI runs inside a
+pseudo-terminal proxied by ccw; after the reset time the resume prompt is
+typed into the same, still running session.
+
 Zero dependencies: Python 3.8+ standard library only. Single file.
 """
 from __future__ import annotations
 
 import argparse
+import codecs
 import collections
 import contextlib
 import json
@@ -17,6 +22,7 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import threading
@@ -58,6 +64,29 @@ TERMINATE_TIMEOUT_SEC = 5.0
 
 ENV_CLAUDE_CMD = "CCW_CLAUDE_CMD"
 _CLAUDE_PKG_PARTS = ("node_modules", "@anthropic-ai", "claude-code")
+
+# Interactive mode (PTY) ----------------------------------------------------
+INTERACTIVE_UNSUPPORTED_MESSAGE = (
+    "Interactive mode (-i) requires a POSIX environment with pty and termios "
+    "(WSL2, macOS or Linux). Use standard headless mode instead."
+)
+WSL_NOT_FOUND_MESSAGE = (
+    "Interactive mode (-i) on Windows runs ccw inside WSL2, but wsl.exe was not found. "
+    "Install WSL2 (e.g., 'wsl --install') or use standard headless mode."
+)
+WSLPATH_TIMEOUT_SEC = 120.0      # the first wsl.exe call may have to boot the VM
+PTY_READ_SIZE = 65536
+PTY_WRITE_SIZE = 4096
+STDIN_READ_SIZE = 4096
+SELECT_MAX_TIMEOUT_SEC = 1.0     # re-check the child and the wall clock at least this often
+OUTPUT_SETTLE_SEC = 0.3          # scan new output once it has been quiet this long ...
+SCAN_MAX_DELAY_SEC = 2.0         # ... or at the latest this long after it arrived
+INPUT_IDLE_SEC = 2.0             # never type the resume prompt while the user is typing
+RESUME_SUBMIT_DELAY_SEC = 0.5    # gap between the prompt text and "\r" (not taken as a paste)
+REDACT_HOLD_SEC = 0.05           # how long a chunk's trailing text may be held for redaction
+REDACT_TEXT_HOLD_MAX = 256       # at most this many trailing characters are held
+ESCAPE_HOLD_MAX = 4096           # an unterminated escape sequence longer than this is passed on
+PARTIAL_LINE_MAX = 4096
 
 # --------------------------------------------------------------------------
 # Limit detection & reset time parsing
@@ -149,15 +178,23 @@ def parse_limit_message(line: str, now: datetime | None = None) -> LimitInfo:
     return LimitInfo(True, parse_reset_time(line, now), line.rstrip("\r\n"))
 
 
-def detect_limit(lines: Sequence[str], now: datetime | None = None) -> LimitInfo:
+def detect_limit(
+    lines: Sequence[str],
+    now: datetime | None = None,
+    tail_lines: int | None = DETECT_TAIL_LINES,
+) -> LimitInfo:
     """Look for the limit message in the tail of the captured output.
 
     If the matching line carries no time, the following one or two lines are
     checked as well (some versions print "resets 3pm" on its own line).
+    ``tail_lines=None`` inspects every line (interactive mode, where the TUI
+    redraws its input box below the message).
     """
     if now is None:
         now = datetime.now()
-    tail = [ln for ln in lines if ln.strip()][-DETECT_TAIL_LINES:]
+    tail = [ln for ln in lines if ln.strip()]
+    if tail_lines is not None:
+        tail = tail[-tail_lines:]
     for idx in range(len(tail) - 1, -1, -1):
         info = parse_limit_message(tail[idx], now)
         if not info.detected:
@@ -257,6 +294,152 @@ class Redactor:
 
 
 # --------------------------------------------------------------------------
+# Terminal output (interactive mode): ANSI handling and width-preserving redaction
+# --------------------------------------------------------------------------
+
+_ANSI_SEQUENCE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"                 # CSI (colors, cursor movement, erase)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"     # OSC (title, hyperlinks), BEL or ST
+    r"|\x1b[P^_X][^\x1b]*(?:\x1b\\)?"          # DCS / PM / APC / SOS
+    r"|\x1b[ -/]*[0-~]?"                       # other escapes (ESC 7, ESC ( B, ...), lone ESC
+)
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_LINE_BREAK = re.compile(r"\r\n|[\r\n]")
+
+
+def _ansi_replacement(match: re.Match[str]) -> str:
+    seq = match.group(0)
+    if seq.startswith("\x1b["):
+        final = seq[-1]
+        if final in "ABEFHfd":   # cursor moved to another line
+            return "\n"
+        if final in "CG":        # horizontal move: keep the words apart
+            return " "
+    return ""
+
+
+def strip_ansi(text: str) -> str:
+    """Remove terminal escape sequences and control characters from ``text``.
+
+    The result is only used for limit detection; the screen always gets the
+    original sequences. Moves to another line become newlines so that the
+    text of different screen rows is not glued together.
+    """
+    return _CONTROL_CHARS.sub("", _ANSI_SEQUENCE.sub(_ansi_replacement, text))
+
+
+def _mask_same_width(match: re.Match[str], repl: str) -> str:
+    """Like ``match.expand(repl)``, but the masked part keeps its width."""
+    original = match.group(0)
+    expanded = match.expand(repl)
+    head = expanded.find(_MASK)
+    if head < 0:
+        return expanded
+    tail = len(expanded) - head - len(_MASK)
+    width = len(original) - head - tail
+    if width <= 0:
+        return original
+    return expanded[:head] + "*" * width + expanded[len(expanded) - tail:]
+
+
+def redact_secrets_same_width(text: str) -> str:
+    """Mask the same secrets as ``redact_secrets`` with ``*`` of equal length.
+
+    Keeping the length keeps a TUI's layout and cursor positions intact.
+    """
+    rules = [(_PEM_INLINE, r"\1" + _MASK + r"\2"), *_REDACT_RULES]
+    for pattern, repl in rules:
+        text = pattern.sub(lambda m, repl=repl: _mask_same_width(m, repl), text)
+    return text
+
+
+def _escape_end(data: str, start: int) -> int | None:
+    """End index of the escape sequence at ``data[start]``, or None if incomplete."""
+    n = len(data)
+    if start + 1 >= n:
+        return None
+    kind = data[start + 1]
+    if kind == "[":
+        j = start + 2
+        while j < n and "0" <= data[j] <= "?":
+            j += 1
+        while j < n and " " <= data[j] <= "/":
+            j += 1
+        if j >= n:
+            return None
+        return j + 1 if "@" <= data[j] <= "~" else j  # malformed: end before the odd char
+    if kind in "]P^_X":
+        j = start + 2
+        while j < n:
+            ch = data[j]
+            if ch == "\x07" and kind == "]":
+                return j + 1
+            if ch == "\x1b":
+                if j + 1 >= n:
+                    return None
+                return j + 2 if data[j + 1] == "\\" else j
+            j += 1
+        return None
+    j = start + 1
+    while j < n and " " <= data[j] <= "/":
+        j += 1
+    if j >= n:
+        return None
+    return j + 1
+
+
+class TerminalRedactor:
+    """Redacts a raw terminal stream without touching its escape sequences.
+
+    Text between escape sequences is masked with ``redact_secrets_same_width``.
+    An incomplete escape sequence at the end of a chunk, and the chunk's
+    trailing text (so that a secret split across two reads is still seen
+    whole), are held back until the next chunk or ``flush()``.
+    """
+
+    def __init__(self) -> None:
+        self._pending = ""
+
+    @property
+    def pending(self) -> bool:
+        return bool(self._pending)
+
+    def feed(self, text: str) -> str:
+        data = self._pending + text
+        self._pending = ""
+        out: list[str] = []
+        pos = 0
+        n = len(data)
+        while pos < n:
+            esc = data.find("\x1b", pos)
+            if esc < 0:
+                run = data[pos:]
+                keep = run[-REDACT_TEXT_HOLD_MAX:]
+                head = run[:len(run) - len(keep)]
+                if head:
+                    out.append(redact_secrets_same_width(head))
+                self._pending = keep
+                break
+            if esc > pos:
+                out.append(redact_secrets_same_width(data[pos:esc]))
+            end = _escape_end(data, esc)
+            if end is None:
+                if n - esc <= ESCAPE_HOLD_MAX:
+                    self._pending = data[esc:]
+                    break
+                end = n
+            out.append(data[esc:end])
+            pos = end
+        return "".join(out)
+
+    def flush(self) -> str:
+        data, self._pending = self._pending, ""
+        if not data or data.startswith("\x1b"):
+            return data
+        return redact_secrets_same_width(data)
+
+
+# --------------------------------------------------------------------------
 # Lock file
 # --------------------------------------------------------------------------
 
@@ -266,11 +449,17 @@ class LockError(Exception):
 
 
 class LockHeldError(LockError):
-    def __init__(self, path: str, pid: int | None) -> None:
+    def __init__(self, path: str, pid: int | None, other_os: str | None = None) -> None:
         who = f"PID {pid}" if pid is not None else "another process"
-        super().__init__(f"another ccw ({who}) is already running here: {path}")
+        message = f"another ccw ({who}) is already running here: {path}"
+        if other_os is not None:
+            side = "native Windows" if other_os == "nt" else "WSL2 or another POSIX system"
+            message += (f" (the lock was written on {side}, so its PID cannot be checked from here; "
+                        "if no ccw is running there, delete the lock file)")
+        super().__init__(message)
         self.path = path
         self.pid = pid
+        self.other_os = other_os
 
 
 _LOCK_CREATE_FLAGS = (
@@ -403,6 +592,7 @@ def acquire_lock(
     payload = json.dumps(
         {
             "pid": pid,
+            "os": os.name,  # PIDs from the other side (Windows vs WSL2) cannot be checked
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "cwd": os.path.abspath(directory),
         },
@@ -423,6 +613,9 @@ def acquire_lock(
                     raise LockHeldError(path, None) from None
             else:
                 other = int(existing["pid"])  # type: ignore[arg-type]
+                lock_os = existing.get("os")
+                if isinstance(lock_os, str) and lock_os != os.name:
+                    raise LockHeldError(path, other, lock_os) from None
                 if other == pid or is_alive(other):
                     raise LockHeldError(path, other) from None
             _reject_symlink(path)
@@ -588,20 +781,23 @@ class ChildRunner:
 
     def terminate(self, wait: bool = True) -> None:
         """Stop the running child. ``wait=False`` kills it without waiting."""
-        proc = self.proc
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            if not wait:
-                proc.kill()
-                return
-            proc.terminate()
-            proc.wait(timeout=TERMINATE_TIMEOUT_SEC)
-        except subprocess.TimeoutExpired:
+        _terminate_process(self.proc, wait)
+
+
+def _terminate_process(proc: subprocess.Popen | None, wait: bool = True) -> None:  # type: ignore[type-arg]
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if not wait:
             proc.kill()
-            proc.wait()
-        except OSError:
-            pass
+            return
+        proc.terminate()
+        proc.wait(timeout=TERMINATE_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    except OSError:
+        pass
 
 
 # Exit status of a Windows process ended by Ctrl+C / Ctrl+Break.
@@ -635,6 +831,426 @@ def _feed_stdin(proc: subprocess.Popen[str], text: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# Interactive mode: auto-resume controller and PTY proxy (POSIX only)
+# --------------------------------------------------------------------------
+
+
+def find_wsl() -> str | None:
+    """Path of ``wsl.exe`` on native Windows, or None if WSL is not installed."""
+    return shutil.which("wsl") or shutil.which("wsl.exe")
+
+
+class WslError(RuntimeError):
+    pass
+
+
+def to_wsl_path(wsl: str, path: str) -> str:
+    """Convert a Windows path to its WSL path with ``wslpath -u``."""
+    try:
+        result = subprocess.run(
+            [wsl, "-e", "wslpath", "-u", path], stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=WSLPATH_TIMEOUT_SEC, shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WslError(f"could not run wslpath in WSL: {exc}") from exc
+    # wsl.exe's own errors are UTF-16; only the Linux side's output is UTF-8.
+    converted = result.stdout.decode("utf-8", "replace").strip()
+    if result.returncode != 0 or not converted.startswith("/"):
+        raise WslError(
+            f"could not convert {path!r} to a WSL path (wslpath exit {result.returncode}); "
+            "check that a Linux distribution is installed ('wsl --list')"
+        )
+    return converted
+
+
+def wsl_delegate_command(wsl: str, script: str, argv: Sequence[str]) -> list[str]:
+    """``wsl.exe -e python3 <script> <argv>``; ``-e`` runs it without a Linux shell."""
+    return [wsl, "-e", "python3", to_wsl_path(wsl, script), *argv]
+
+
+def run_in_wsl(cmd: Sequence[str], cwd: str) -> int:
+    """Run ``cmd`` (wsl.exe ...) on this console and return its exit code.
+
+    WSL maps ``cwd`` to its own path (``C:\\x`` -> ``/mnt/c/x``). Ctrl+C is
+    for the Linux side (claude's TUI), so this side keeps waiting instead of
+    killing the child as ``subprocess.run`` would.
+    """
+    proc = subprocess.Popen(list(cmd), cwd=cwd, shell=False)
+    while True:
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            continue
+
+
+def interactive_unsupported_reason() -> str | None:
+    """Why ``-i`` cannot run here, or None if it can (native Windows is delegated to WSL)."""
+    try:
+        import fcntl  # noqa: F401
+        import pty  # noqa: F401
+        import termios  # noqa: F401
+        import tty  # noqa: F401
+    except ImportError:
+        return INTERACTIVE_UNSUPPORTED_MESSAGE
+    return None
+
+
+def _line_key(line: str) -> str:
+    return " ".join(line.split())
+
+
+class AutoResumer:
+    """Decides when to type the resume prompt into an interactive session.
+
+    Pure state machine (no I/O): the PTY loop feeds it the redacted output
+    and keystroke times, and writes whatever ``poll()`` returns to claude.
+
+    WATCHING   -> scan new output lines for the limit message
+    WAITING    -> claude stays open; wait for the reset time and idle input
+    SUBMITTING -> resume prompt typed; "\\r" follows after a short gap
+    GAVE_UP    -> --max-retries used up; no more auto-resume
+    """
+
+    WATCHING = "watching"
+    WAITING = "waiting"
+    SUBMITTING = "submitting"
+    GAVE_UP = "gave_up"
+
+    def __init__(
+        self,
+        resume_prompt: str,
+        max_retries: int,
+        buffer_sec: int,
+        fallback_wait: int,
+        now_fn: Callable[[], datetime],
+        log: Callable[[str], None],
+    ) -> None:
+        self.resume_prompt = resume_prompt
+        self.max_retries = max_retries
+        self.buffer_sec = buffer_sec
+        self.fallback_wait = fallback_wait
+        self.now_fn = now_fn
+        self.log = log
+        self.state = self.WATCHING
+        self.retry_count = 0
+        self.target: datetime | None = None
+        self._lines: collections.deque[str] = collections.deque(maxlen=OUTPUT_BUFFER_LINES)
+        self._partial = ""
+        self._first_unscanned: float | None = None
+        self._last_output = 0.0
+        self._last_input: float | None = None
+        self._submit_at = 0.0
+        # Limit lines already acted on. The TUI redraws its transcript (e.g. on
+        # resize), and the same line must not start a second wait.
+        self._handled: set[str] = set()
+
+    @property
+    def gave_up(self) -> bool:
+        return self.state == self.GAVE_UP
+
+    def on_output(self, text: str, mono: float) -> None:
+        if self.state != self.WATCHING:
+            return  # output during the wait (the same screen redrawn) is not scanned
+        stripped = strip_ansi(text)
+        if not stripped:
+            return
+        parts = _LINE_BREAK.split(self._partial + stripped)
+        self._partial = parts.pop()
+        self._lines.extend(parts)
+        if len(self._partial) > PARTIAL_LINE_MAX:
+            self._lines.append(self._partial)
+            self._partial = ""
+        self._last_output = mono
+        if self._first_unscanned is None:
+            self._first_unscanned = mono
+
+    def on_input(self, mono: float) -> None:
+        self._last_input = mono
+
+    def _input_idle_left(self, mono: float) -> float:
+        if self._last_input is None:
+            return 0.0
+        return max(0.0, self._last_input + INPUT_IDLE_SEC - mono)
+
+    def timeout(self, mono: float) -> float | None:
+        """Seconds until ``poll()`` may have something to do (None: no deadline)."""
+        if self.state == self.WATCHING:
+            if self._first_unscanned is None:
+                return None
+            due = min(self._last_output + OUTPUT_SETTLE_SEC, self._first_unscanned + SCAN_MAX_DELAY_SEC)
+            return max(0.0, due - mono)
+        if self.state == self.WAITING:
+            assert self.target is not None
+            remaining = (self.target - self.now_fn()).total_seconds()
+            if remaining > 0:
+                return min(remaining, STATUS_INTERVAL_SEC)
+            return self._input_idle_left(mono)
+        if self.state == self.SUBMITTING:
+            return max(0.0, self._submit_at - mono)
+        return None
+
+    def poll(self, mono: float) -> bytes:
+        """Advance the state machine; return bytes to type into claude."""
+        if self.state == self.WATCHING:
+            if self._first_unscanned is not None and (
+                mono - self._last_output >= OUTPUT_SETTLE_SEC
+                or mono - self._first_unscanned >= SCAN_MAX_DELAY_SEC
+            ):
+                self._scan()
+            return b""
+        if self.state == self.WAITING:
+            assert self.target is not None
+            if self.now_fn() < self.target or self._input_idle_left(mono) > 0:
+                return b""
+            self.retry_count += 1
+            self.log(f"resuming session ({self.retry_count}/{self.max_retries})")
+            self.state = self.SUBMITTING
+            self._submit_at = mono + RESUME_SUBMIT_DELAY_SEC
+            return self.resume_prompt.encode("utf-8")
+        if self.state == self.SUBMITTING:
+            if mono < self._submit_at:
+                return b""
+            self._reset_scan()
+            self.state = self.WATCHING
+            return b"\r"
+        return b""
+
+    def _reset_scan(self) -> None:
+        self._lines.clear()
+        self._partial = ""
+        self._first_unscanned = None
+        self.target = None
+
+    def _scan(self) -> None:
+        lines = list(self._lines)
+        if self._partial.strip():
+            lines.append(self._partial)
+        self._reset_scan()
+        fresh = [ln for ln in lines if _line_key(ln) not in self._handled]
+        now = self.now_fn()
+        info = detect_limit(fresh, now, tail_lines=None)
+        if not info.detected:
+            return
+        self._handled.add(_line_key(info.raw_line))
+        self.log(f"session limit detected: {info.raw_line.strip()}")
+        if self.retry_count >= self.max_retries:
+            self.log(f"giving up auto-resume after {self.retry_count} resume(s) "
+                     f"(--max-retries {self.max_retries}); claude keeps running")
+            self.state = self.GAVE_UP
+            return
+        seconds = compute_wait_seconds(info, now, self.buffer_sec, self.fallback_wait)
+        if info.reset_at is None:
+            self.log(f"reset time not found; using fallback wait of {self.fallback_wait}s")
+        self.target = now + timedelta(seconds=seconds)
+        self.log(f"waiting for limit reset: {_format_duration(seconds)} "
+                 f"(resume at {self.target.isoformat(timespec='seconds')}); the session stays open")
+        self.state = self.WAITING
+
+
+def _isatty(fd: int) -> bool:
+    try:
+        return os.isatty(fd)
+    except OSError:
+        return False
+
+
+def _copy_winsize(src_fd: int, dst_fd: int) -> bool:
+    """Copy the window size of terminal ``src_fd`` to ``dst_fd`` (a PTY)."""
+    import fcntl
+    import termios
+
+    try:
+        packed = fcntl.ioctl(src_fd, termios.TIOCGWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
+        rows, cols, _, _ = struct.unpack("HHHH", packed)
+        if rows == 0 or cols == 0:
+            return False
+        fcntl.ioctl(dst_fd, termios.TIOCSWINSZ, packed)
+    except OSError:
+        return False
+    return True
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    import select
+
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except BlockingIOError:
+            select.select([], [fd], [], SELECT_MAX_TIMEOUT_SEC)
+            continue
+        view = view[written:]
+
+
+class PtyRunner:
+    """Runs claude's TUI in a pseudo-terminal and proxies it transparently.
+
+    The parent terminal is put into raw mode so every key (arrows, Esc,
+    Ctrl+C, Shift+Tab, ...) reaches claude unchanged; its attributes are
+    always restored in ``finally``. Output is redacted without touching
+    escape sequences and handed to an ``AutoResumer`` for limit detection.
+    """
+
+    def __init__(
+        self,
+        stdin_fd: int,
+        stdout_fd: int,
+        raw_flag: threading.Event,
+        env: Mapping[str, str] | None = None,
+    ) -> None:
+        self.stdin_fd = stdin_fd
+        self.stdout_fd = stdout_fd
+        self.raw_flag = raw_flag
+        self.env = env
+        self.proc: subprocess.Popen | None = None  # type: ignore[type-arg]
+
+    def terminate(self, wait: bool = True) -> None:
+        _terminate_process(self.proc, wait)
+
+    def _size_source(self) -> int | None:
+        for fd in (self.stdout_fd, self.stdin_fd):
+            if _isatty(fd):
+                return fd
+        return None
+
+    def run(self, cmd: Sequence[str], resumer: AutoResumer) -> int:
+        import fcntl
+        import pty
+        import termios
+        import tty
+
+        env = dict(os.environ if self.env is None else self.env)
+        env["PYTHONUTF8"] = "1"
+
+        def make_controlling_tty() -> None:  # runs in the child before exec
+            with contextlib.suppress(OSError, AttributeError):
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+
+        size_src = self._size_source()
+        master_fd, slave_fd = pty.openpty()
+        try:
+            if size_src is not None:
+                _copy_winsize(size_src, slave_fd)  # claude starts at the right size
+            self.proc = subprocess.Popen(
+                list(cmd),
+                shell=False,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+                preexec_fn=make_controlling_tty,
+                env=env,
+            )
+        except BaseException:
+            os.close(master_fd)
+            raise
+        finally:
+            os.close(slave_fd)
+
+        saved_attrs = None
+        previous_winch: object = None
+        winch_installed = False
+        try:
+            os.set_blocking(master_fd, False)
+            sigwinch = getattr(signal, "SIGWINCH", None)
+            if size_src is not None and sigwinch is not None:
+                with contextlib.suppress(ValueError, OSError):  # not in the main thread
+                    previous_winch = signal.signal(
+                        sigwinch, lambda signum, frame: _copy_winsize(size_src, master_fd)
+                    )
+                    winch_installed = True
+            if _isatty(self.stdin_fd):
+                saved_attrs = termios.tcgetattr(self.stdin_fd)
+                tty.setraw(self.stdin_fd)
+                self.raw_flag.set()
+            self._proxy(master_fd, resumer)
+        finally:
+            if saved_attrs is not None:
+                with contextlib.suppress(termios.error, OSError):
+                    termios.tcsetattr(self.stdin_fd, termios.TCSADRAIN, saved_attrs)
+                self.raw_flag.clear()
+            if winch_installed:
+                with contextlib.suppress(ValueError, OSError, TypeError):
+                    signal.signal(signal.SIGWINCH, previous_winch or signal.SIG_DFL)  # type: ignore[arg-type]
+            os.close(master_fd)
+
+        proc = self.proc
+        try:
+            rc = proc.wait(timeout=TERMINATE_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:  # closed the terminal but kept running
+            _terminate_process(proc)
+            rc = proc.wait()
+        self.proc = None
+        return _normalize_exit_code(rc)
+
+    def _proxy(self, master_fd: int, resumer: AutoResumer) -> None:
+        import select
+
+        assert self.proc is not None
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        redactor = TerminalRedactor()
+        to_child = bytearray()
+        stdin_open = True
+
+        def emit(text: str) -> None:
+            if text:
+                _write_all(self.stdout_fd, text.encode("utf-8", "replace"))
+                resumer.on_output(text, time.monotonic())
+
+        while True:
+            mono = time.monotonic()
+            to_child += resumer.poll(mono)
+            timeouts = [SELECT_MAX_TIMEOUT_SEC]
+            deadline = resumer.timeout(mono)
+            if deadline is not None:
+                timeouts.append(deadline)
+            if redactor.pending:
+                timeouts.append(REDACT_HOLD_SEC)
+            rlist = [master_fd] + ([self.stdin_fd] if stdin_open else [])
+            wlist = [master_fd] if to_child else []
+            readable, writable, _ = select.select(rlist, wlist, [], max(0.0, min(timeouts)))
+
+            if master_fd in writable and to_child:
+                try:
+                    written = os.write(master_fd, to_child[:PTY_WRITE_SIZE])
+                    del to_child[:written]
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    to_child.clear()  # claude is gone
+
+            if master_fd in readable:
+                try:
+                    chunk: bytes | None = os.read(master_fd, PTY_READ_SIZE)
+                except BlockingIOError:
+                    chunk = None
+                except OSError:  # EIO: every slave fd is closed (Linux)
+                    chunk = b""
+                if chunk == b"":
+                    break
+                if chunk:
+                    emit(redactor.feed(decoder.decode(chunk)))
+            elif redactor.pending:
+                emit(redactor.flush())
+
+            if stdin_open and self.stdin_fd in readable:
+                try:
+                    keys = os.read(self.stdin_fd, STDIN_READ_SIZE)
+                except OSError:
+                    keys = b""
+                if keys:
+                    resumer.on_input(time.monotonic())
+                    to_child += keys
+                else:
+                    stdin_open = False  # EOF (not a terminal); claude keeps running
+
+            if not readable and self.proc.poll() is not None:
+                break  # claude exited and nothing is left to read
+        emit(redactor.feed(decoder.decode(b"", final=True)) + redactor.flush())
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -663,12 +1279,18 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ccw",
         description="Run claude -p and auto-resume after the 5-hour session limit.",
         usage=('ccw [ccw-options] "<initial prompt>" [-- claude-options...]\n'
-               '       ccw [ccw-options] (--stdin | --prompt-file PATH) [-- claude-options...]'),
+               '       ccw [ccw-options] (--stdin | --prompt-file PATH) [-- claude-options...]\n'
+               '       ccw -i [ccw-options] ["<initial prompt>"] [-- claude-options...]'),
         epilog=("Options after -- are passed to claude on the initial run and on every "
                 "resume (e.g. --model, --allowedTools, --permission-mode). "
-                "-p/--print, -c/--continue and -r/--resume are managed by ccw."),
+                "-p/--print, -c/--continue and -r/--resume are managed by ccw "
+                "(with -i only -p/--print is)."),
     )
     parser.add_argument("prompt", nargs="?", help="initial prompt (passed as claude -p PROMPT)")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="run claude's interactive TUI through a pseudo-terminal and type the "
+                             "resume prompt into the same session after the limit resets (on native "
+                             "Windows, ccw runs itself inside WSL2)")
     parser.add_argument("--resume-prompt", default=DEFAULT_RESUME_PROMPT, metavar="TEXT",
                         help="prompt sent upon auto-resume (default: %(default)s)")
     parser.add_argument("--max-retries", type=_non_negative_int, default=DEFAULT_MAX_RETRIES,
@@ -690,6 +1312,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 # claude options that ccw manages itself and therefore must not appear after "--".
 RESERVED_CLAUDE_OPTIONS = ("-p", "--print", "-c", "--continue", "-r", "--resume")
+# Interactive mode launches claude once and never restarts it, so choosing the
+# conversation with --continue / --resume is fine there; only -p conflicts.
+RESERVED_INTERACTIVE_OPTIONS = ("-p", "--print")
 
 
 @dataclass
@@ -703,6 +1328,7 @@ class Options:
     prompt: str | None           # positional prompt, passed in argv
     initial_stdin: str | None    # --stdin / --prompt-file prompt, piped to stdin
     prompt_source: str
+    interactive: bool = False    # -i: TUI in a PTY, resume typed into the same session
 
     # "-p" always comes after claude_args so that a variadic option such as
     # --allowedTools cannot swallow the prompt. ``placeholder`` replaces the
@@ -718,11 +1344,22 @@ class Options:
         prompt = self.resume_prompt if placeholder is None else placeholder
         return [*self.claude_args, "--continue", "-p", prompt]
 
+    def interactive_args(self, placeholder: str | None = None) -> list[str]:
+        # "--" ends claude's option parsing, so a variadic option such as
+        # --allowedTools cannot swallow the prompt.
+        args = list(self.claude_args)
+        if self.prompt is not None:
+            args += ["--", self.prompt if placeholder is None else placeholder]
+        return args
 
-def _check_claude_args(args: Sequence[str]) -> None:
+
+def _check_claude_args(args: Sequence[str], interactive: bool = False) -> None:
+    reserved = RESERVED_INTERACTIVE_OPTIONS if interactive else RESERVED_CLAUDE_OPTIONS
     for arg in args:
         name = arg.split("=", 1)[0] if arg.startswith("--") else arg
-        if name in RESERVED_CLAUDE_OPTIONS:
+        if name in reserved:
+            if interactive:
+                raise UsageError(f"{arg!r} cannot be used with --interactive (it runs claude's TUI)")
             raise UsageError(
                 f"{arg!r} is managed by ccw and cannot be passed after --; "
                 "give the prompt to ccw itself (\"<prompt>\", --stdin or --prompt-file)"
@@ -758,7 +1395,10 @@ def parse_options(argv: Sequence[str], stdin: TextIO) -> Options:
         )
         if used
     ]
-    if not sources:
+    if ns.interactive and (ns.stdin or ns.prompt_file is not None):
+        raise UsageError("--stdin / --prompt-file cannot be used with --interactive "
+                         "(stdin is your keyboard); pass \"<prompt>\" or type it in claude")
+    if not sources and not ns.interactive:
         raise UsageError('no prompt given (use "<prompt>", --stdin or --prompt-file)')
     if len(sources) > 1:
         raise UsageError(f"only one prompt source is allowed, got: {', '.join(sources)}")
@@ -769,12 +1409,14 @@ def parse_options(argv: Sequence[str], stdin: TextIO) -> Options:
     if raw is not None:
         if not raw:
             raise UsageError("no claude options after --")
-        _check_claude_args(raw)
+        _check_claude_args(raw, interactive=ns.interactive)
         claude_args = list(raw)
 
     initial_stdin: str | None = None
-    source = sources[0]
-    if source == "prompt":
+    source = sources[0] if sources else "none"
+    if source == "none":
+        pass
+    elif source == "prompt":
         if not ns.prompt.strip():
             raise UsageError("prompt must not be empty")
     else:
@@ -800,6 +1442,7 @@ def parse_options(argv: Sequence[str], stdin: TextIO) -> Options:
         prompt=ns.prompt,
         initial_stdin=initial_stdin,
         prompt_source=source,
+        interactive=ns.interactive,
     )
 
 
@@ -834,7 +1477,7 @@ class _Cleanup:
     runs on a separate thread.
     """
 
-    def __init__(self, runner: ChildRunner) -> None:
+    def __init__(self, runner: ChildRunner | PtyRunner) -> None:
         self.runner = runner
         self.lock_path: str | None = None
         self._guard = threading.Lock()
@@ -998,8 +1641,15 @@ def main(
     _prepare_stream(stderr)
     cwd = os.getcwd() if cwd is None else cwd
 
+    # Set while the terminal is in raw mode (interactive), where "\n" no
+    # longer returns the carriage.
+    raw_terminal = threading.Event()
+
     def log(message: str) -> None:
-        stderr.write(f"[ccw] {message}\n")
+        if raw_terminal.is_set():
+            stderr.write(f"\r\n[ccw] {message}\r\n")
+        else:
+            stderr.write(f"[ccw] {message}\n")
         stderr.flush()
 
     # INIT -----------------------------------------------------------------
@@ -1008,6 +1658,38 @@ def main(
     except UsageError as exc:
         log(f"error: {exc}")
         return EXIT_USAGE
+
+    stdin_fd = stdout_fd = -1
+    if opts.interactive and os.name == "nt":
+        # No PTY on native Windows: hand the same arguments to ccw inside WSL2,
+        # which takes the lock and resolves claude itself.
+        wsl = find_wsl()
+        if wsl is None:
+            log(f"error: {WSL_NOT_FOUND_MESSAGE}")
+            return EXIT_USAGE
+        try:
+            cmd = wsl_delegate_command(wsl, os.path.abspath(__file__), argv)
+        except WslError as exc:
+            log(f"error: {exc}")
+            return EXIT_USAGE
+        log(f"interactive mode needs a PTY; running ccw in WSL2 ({cmd[3]})")
+        try:
+            return run_in_wsl(cmd, cwd)
+        except OSError as exc:
+            log(f"error: cannot start {wsl}: {exc}")
+            return EXIT_USAGE
+
+    if opts.interactive:
+        reason = interactive_unsupported_reason()
+        if reason is not None:
+            log(f"error: {reason}")
+            return EXIT_USAGE
+        if not opts.dry_run:
+            try:
+                stdin_fd, stdout_fd = stdin.fileno(), stdout.fileno()
+            except (AttributeError, OSError, ValueError):
+                log("error: --interactive needs stdin and stdout to be real files or terminals")
+                return EXIT_USAGE
 
     if claude_cmd is None:
         try:
@@ -1020,7 +1702,9 @@ def main(
             claude_cmd = ["claude"]
     base_cmd = list(claude_cmd)
 
-    runner = ChildRunner(stdout)
+    runner: ChildRunner | PtyRunner = (
+        PtyRunner(stdin_fd, stdout_fd, raw_terminal) if opts.interactive else ChildRunner(stdout)
+    )
     cleanup = _Cleanup(runner)
     restore_handlers = _install_handlers(cleanup)
     try:
@@ -1032,10 +1716,35 @@ def main(
 
         if opts.dry_run:
             log(f"dry run: lock acquired at {cleanup.lock_path}")
-            log(f"dry run: would run {base_cmd + opts.initial_args('<prompt>')!r} "
-                f"(prompt source: {opts.prompt_source})")
-            log(f"dry run: resume with {base_cmd + opts.resume_args('<resume prompt>')!r}")
+            if opts.interactive:
+                log(f"dry run: would run {base_cmd + opts.interactive_args('<prompt>')!r} "
+                    "in a pseudo-terminal (interactive)")
+                log("dry run: on a limit hit, would type '<resume prompt>' + CR into the same session")
+            else:
+                log(f"dry run: would run {base_cmd + opts.initial_args('<prompt>')!r} "
+                    f"(prompt source: {opts.prompt_source})")
+                log(f"dry run: resume with {base_cmd + opts.resume_args('<resume prompt>')!r}")
             return EXIT_OK
+
+        if isinstance(runner, PtyRunner):
+            # RUNNING_INTERACTIVE ---------------------------------------------
+            resumer = AutoResumer(opts.resume_prompt, opts.max_retries, opts.buffer_sec,
+                                  opts.fallback_wait, now_fn, log)
+            with contextlib.suppress(OSError, ValueError):
+                stdout.flush()  # ccw writes to the fd directly from here on
+            try:
+                rc = runner.run(base_cmd + opts.interactive_args(), resumer)
+            except OSError as exc:
+                log(f"error: failed to start claude: {exc}")
+                return EXIT_USAGE
+            if rc == EXIT_INTERRUPTED:
+                log("interrupted")
+                return EXIT_INTERRUPTED
+            if resumer.gave_up:
+                return EXIT_MAX_RETRIES
+            if rc != 0:
+                log(f"claude exited with code {rc}")
+            return rc
 
         retry_count = 0
         cmd = base_cmd + opts.initial_args()
