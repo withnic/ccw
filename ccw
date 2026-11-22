@@ -5,7 +5,7 @@ Runs ``claude -p`` headlessly, watches its output for the 5-hour session
 limit message, sleeps until the limit resets and resumes the same
 directory-scoped session with ``claude --continue -p "<resume prompt>"``.
 
-With ``-i`` / ``--interactive`` (POSIX only) claude's normal TUI runs inside a
+With ``-i`` / ``--interactive`` (PTY on POSIX, WSL2 from native Windows) claude's normal TUI runs inside a
 pseudo-terminal proxied by ccw; after the reset time the resume prompt is
 typed into the same, still running session.
 
@@ -67,9 +67,14 @@ _CLAUDE_PKG_PARTS = ("node_modules", "@anthropic-ai", "claude-code")
 
 # Interactive mode (PTY) ----------------------------------------------------
 INTERACTIVE_UNSUPPORTED_MESSAGE = (
-    "Interactive mode (-i) requires a POSIX environment (WSL2 or macOS). "
-    "On Windows, run via WSL2 (e.g., 'wsl ccw -i') or use standard headless mode."
+    "Interactive mode (-i) requires a POSIX environment with pty and termios "
+    "(WSL2, macOS or Linux). Use standard headless mode instead."
 )
+WSL_NOT_FOUND_MESSAGE = (
+    "Interactive mode (-i) on Windows runs ccw inside WSL2, but wsl.exe was not found. "
+    "Install WSL2 (e.g., 'wsl --install') or use standard headless mode."
+)
+WSLPATH_TIMEOUT_SEC = 120.0      # the first wsl.exe call may have to boot the VM
 PTY_READ_SIZE = 65536
 PTY_WRITE_SIZE = 4096
 STDIN_READ_SIZE = 4096
@@ -444,11 +449,17 @@ class LockError(Exception):
 
 
 class LockHeldError(LockError):
-    def __init__(self, path: str, pid: int | None) -> None:
+    def __init__(self, path: str, pid: int | None, other_os: str | None = None) -> None:
         who = f"PID {pid}" if pid is not None else "another process"
-        super().__init__(f"another ccw ({who}) is already running here: {path}")
+        message = f"another ccw ({who}) is already running here: {path}"
+        if other_os is not None:
+            side = "native Windows" if other_os == "nt" else "WSL2 or another POSIX system"
+            message += (f" (the lock was written on {side}, so its PID cannot be checked from here; "
+                        "if no ccw is running there, delete the lock file)")
+        super().__init__(message)
         self.path = path
         self.pid = pid
+        self.other_os = other_os
 
 
 _LOCK_CREATE_FLAGS = (
@@ -581,6 +592,7 @@ def acquire_lock(
     payload = json.dumps(
         {
             "pid": pid,
+            "os": os.name,  # PIDs from the other side (Windows vs WSL2) cannot be checked
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "cwd": os.path.abspath(directory),
         },
@@ -601,6 +613,9 @@ def acquire_lock(
                     raise LockHeldError(path, None) from None
             else:
                 other = int(existing["pid"])  # type: ignore[arg-type]
+                lock_os = existing.get("os")
+                if isinstance(lock_os, str) and lock_os != os.name:
+                    raise LockHeldError(path, other, lock_os) from None
                 if other == pid or is_alive(other):
                     raise LockHeldError(path, other) from None
             _reject_symlink(path)
@@ -820,10 +835,56 @@ def _feed_stdin(proc: subprocess.Popen[str], text: str) -> None:
 # --------------------------------------------------------------------------
 
 
+def find_wsl() -> str | None:
+    """Path of ``wsl.exe`` on native Windows, or None if WSL is not installed."""
+    return shutil.which("wsl") or shutil.which("wsl.exe")
+
+
+class WslError(RuntimeError):
+    pass
+
+
+def to_wsl_path(wsl: str, path: str) -> str:
+    """Convert a Windows path to its WSL path with ``wslpath -u``."""
+    try:
+        result = subprocess.run(
+            [wsl, "-e", "wslpath", "-u", path], stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=WSLPATH_TIMEOUT_SEC, shell=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WslError(f"could not run wslpath in WSL: {exc}") from exc
+    # wsl.exe's own errors are UTF-16; only the Linux side's output is UTF-8.
+    converted = result.stdout.decode("utf-8", "replace").strip()
+    if result.returncode != 0 or not converted.startswith("/"):
+        raise WslError(
+            f"could not convert {path!r} to a WSL path (wslpath exit {result.returncode}); "
+            "check that a Linux distribution is installed ('wsl --list')"
+        )
+    return converted
+
+
+def wsl_delegate_command(wsl: str, script: str, argv: Sequence[str]) -> list[str]:
+    """``wsl.exe -e python3 <script> <argv>``; ``-e`` runs it without a Linux shell."""
+    return [wsl, "-e", "python3", to_wsl_path(wsl, script), *argv]
+
+
+def run_in_wsl(cmd: Sequence[str], cwd: str) -> int:
+    """Run ``cmd`` (wsl.exe ...) on this console and return its exit code.
+
+    WSL maps ``cwd`` to its own path (``C:\\x`` -> ``/mnt/c/x``). Ctrl+C is
+    for the Linux side (claude's TUI), so this side keeps waiting instead of
+    killing the child as ``subprocess.run`` would.
+    """
+    proc = subprocess.Popen(list(cmd), cwd=cwd, shell=False)
+    while True:
+        try:
+            return proc.wait()
+        except KeyboardInterrupt:
+            continue
+
+
 def interactive_unsupported_reason() -> str | None:
-    """Why ``-i`` cannot run here, or None if it can."""
-    if os.name == "nt":
-        return INTERACTIVE_UNSUPPORTED_MESSAGE
+    """Why ``-i`` cannot run here, or None if it can (native Windows is delegated to WSL)."""
     try:
         import fcntl  # noqa: F401
         import pty  # noqa: F401
@@ -1228,7 +1289,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("prompt", nargs="?", help="initial prompt (passed as claude -p PROMPT)")
     parser.add_argument("-i", "--interactive", action="store_true",
                         help="run claude's interactive TUI through a pseudo-terminal and type the "
-                             "resume prompt into the same session after the limit resets (POSIX only)")
+                             "resume prompt into the same session after the limit resets (on native "
+                             "Windows, ccw runs itself inside WSL2)")
     parser.add_argument("--resume-prompt", default=DEFAULT_RESUME_PROMPT, metavar="TEXT",
                         help="prompt sent upon auto-resume (default: %(default)s)")
     parser.add_argument("--max-retries", type=_non_negative_int, default=DEFAULT_MAX_RETRIES,
@@ -1598,6 +1660,25 @@ def main(
         return EXIT_USAGE
 
     stdin_fd = stdout_fd = -1
+    if opts.interactive and os.name == "nt":
+        # No PTY on native Windows: hand the same arguments to ccw inside WSL2,
+        # which takes the lock and resolves claude itself.
+        wsl = find_wsl()
+        if wsl is None:
+            log(f"error: {WSL_NOT_FOUND_MESSAGE}")
+            return EXIT_USAGE
+        try:
+            cmd = wsl_delegate_command(wsl, os.path.abspath(__file__), argv)
+        except WslError as exc:
+            log(f"error: {exc}")
+            return EXIT_USAGE
+        log(f"interactive mode needs a PTY; running ccw in WSL2 ({cmd[3]})")
+        try:
+            return run_in_wsl(cmd, cwd)
+        except OSError as exc:
+            log(f"error: cannot start {wsl}: {exc}")
+            return EXIT_USAGE
+
     if opts.interactive:
         reason = interactive_unsupported_reason()
         if reason is not None:

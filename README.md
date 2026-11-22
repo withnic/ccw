@@ -66,7 +66,7 @@ Give the prompt to `ccw`, not after `--`. `-p`/`--print`, `-c`/`--continue` and 
 | Code | Meaning |
 |---|---|
 | `0` | Finished normally |
-| `1` | Invalid arguments, another `ccw` is running in this directory, `claude` was not found, or `-i` on native Windows |
+| `1` | Invalid arguments, another `ccw` is running in this directory, `claude` was not found, or `-i` on native Windows without WSL2 |
 | `2` | Still hitting the limit after `--max-retries` waits |
 | `130` | Interrupted (Ctrl+C, Ctrl+Break, SIGTERM, or the terminal was closed) |
 | other | `claude`'s own exit code |
@@ -80,7 +80,7 @@ Give the prompt to `ccw`, not after `--`. `-p`/`--print`, `-c`/`--continue` and 
 
 `ccw`'s own messages go to stderr with a `[ccw]` prefix.
 
-## Interactive mode (`-i` / `--interactive`, WSL2 and macOS only)
+## Interactive mode (`-i` / `--interactive`)
 
 Use claude's normal interactive TUI. When the 5-hour limit hits, `ccw` types the resume prompt into the same claude screen for you.
 
@@ -97,7 +97,7 @@ ccw -i -- --model opus --continue         # claude options (--continue / --resum
 - If the limit hits again after `--max-retries` resumes, auto-resume stops. claude stays open, and `ccw` exits with `2` when you quit it. Otherwise `ccw` returns claude's own exit code.
 - The TUI draws its input box below the limit message, so every new line is checked, not just the last few. A limit phrase in claude's own reply can therefore start a wait. The `[ccw]` message shows which line matched.
 - Secrets are masked with the same number of `*` so the screen layout stays intact. A secret split by color codes, or a multi-line private key, is not masked in this mode.
-- Not available on native Windows (the standard library has no PTY there). Use WSL2 (`wsl ccw -i`) or the headless mode.
+- On native Windows (PowerShell, Git Bash, ...) `ccw -i` runs itself inside WSL2 in the same folder (the standard library has no PTY on Windows). claude, `python3` and your claude login must be set up inside WSL2; the Windows claude is not used. Windows paths in claude options are not converted. If `wsl.exe` is not installed, `ccw -i` exits with `1`.
 
 ### Output encoding on Windows
 
@@ -114,7 +114,7 @@ PowerShell decodes piped output with `[Console]::OutputEncoding` (often the lega
 - `claude` is always started without a shell (`shell=False`). On Windows, `ccw` never runs npm's `claude.cmd` shim, because `cmd.exe` would re-parse the prompt. It starts the real `claude.exe` instead. If that cannot be found, set `CCW_CLAUDE_CMD` to a JSON array, e.g. `["C:\\path\\to\\claude.exe"]`.
 - Common secrets in claude's output (`sk-ant-...`, AWS keys, `Bearer ...`, GitHub tokens, private keys, ...) are masked before they reach your terminal.
 - With `--stdin` / `--prompt-file`, the prompt is piped to claude's stdin and never appears in any process's argument list.
-- The lock file `.ccw.lock` is created exclusively, with `0600` permissions on POSIX. `ccw` refuses symlinks and only removes its own lock. The lock is removed on Ctrl+C and when the terminal window is closed; a lock left behind by a crash is cleaned up on the next start. Add `.ccw.lock` to your global gitignore (`~/.config/git/ignore`).
+- The lock file `.ccw.lock` is created exclusively, with `0600` permissions on POSIX. `ccw` refuses symlinks and only removes its own lock. The lock is removed on Ctrl+C and when the terminal window is closed; a lock left behind by a crash is cleaned up on the next start. Native Windows and WSL2 cannot check each other's processes, so a lock written on the other side is never cleaned up automatically; if no `ccw` is running there, delete it by hand. Add `.ccw.lock` to your global gitignore (`~/.config/git/ignore`).
 
 ## Running unattended
 

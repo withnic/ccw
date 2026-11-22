@@ -268,8 +268,27 @@ class TestLock(unittest.TestCase):
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
         self.assertEqual(data["pid"], 4242)
+        self.assertEqual(data["os"], os.name)
         self.assertEqual(data["cwd"], os.path.abspath(self.dir))
         datetime.fromisoformat(data["started_at"])
+
+    def test_lock_from_other_os_is_held_without_pid_check(self):
+        # Native Windows and WSL2 share the directory but not PIDs.
+        other = "posix" if os.name == "nt" else "nt"
+        self.write_lock(json.dumps({"pid": 999999, "os": other, "started_at": "x", "cwd": self.dir}))
+        checked = []
+        with self.assertRaises(ccw.LockHeldError) as cm:
+            ccw.acquire_lock(self.dir, pid=5, is_alive=lambda pid: checked.append(pid) or False)
+        self.assertEqual(checked, [])
+        self.assertEqual(cm.exception.other_os, other)
+        self.assertIn("delete the lock file", str(cm.exception))
+        self.assertTrue(os.path.exists(self.path))
+
+    def test_lock_from_same_os_is_still_recovered(self):
+        self.write_lock(json.dumps({"pid": 999999, "os": os.name, "started_at": "x", "cwd": self.dir}))
+        ccw.acquire_lock(self.dir, pid=5, is_alive=lambda pid: False)
+        with open(self.path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["pid"], 5)
 
     @unittest.skipIf(os.name == "nt", "POSIX permissions only")
     def test_posix_permissions_0600(self):
@@ -1052,6 +1071,7 @@ class TestInteractiveOptions(unittest.TestCase):
         with self.assertRaises(ccw.UsageError):
             self.parse([])
 
+    @unittest.skipIf(os.name == "nt", "native Windows delegates -i to WSL (TestInteractiveWindows)")
     def test_dry_run(self):
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(ccw, "interactive_unsupported_reason", return_value=None):
@@ -1065,30 +1085,88 @@ class TestInteractiveOptions(unittest.TestCase):
 
 
 class TestInteractiveWindows(unittest.TestCase):
-    EXPECTED = "Interactive mode (-i) requires a POSIX environment (WSL2 or macOS)"
+    """Native Windows has no PTY: ``-i`` is handed to ccw inside WSL2."""
 
-    def test_native_windows_is_rejected(self):
+    WSL = r"C:\Windows\System32\wsl.exe"
+    ARGV = ["-i", "--buffer-sec", "5", "初回; echo $(id)", "--", "--model", "opus"]
+
+    def run_main(self, argv, which, wslpath=None, wait_rc=0):
+        """Run main() as native Windows with mocked wsl.exe; returns (rc, err, run, popen, tmp)."""
+        wslpath = wslpath or subprocess.CompletedProcess([], 0, b"/mnt/c/tools/ccw\n", b"")
         with tempfile.TemporaryDirectory() as tmp:
-            out, err = io.StringIO(), io.StringIO()
-            with mock.patch.object(ccw.os, "name", "nt"):
-                rc = ccw.main(["-i", "--", "--model", "opus"], claude_cmd=["claude"], cwd=tmp,
-                              stdin=io.StringIO(), stdout=out, stderr=err)
+            err = io.StringIO()
+            with mock.patch.object(ccw.os, "name", "nt"), \
+                    mock.patch.object(ccw.shutil, "which", side_effect=which) as which_mock, \
+                    mock.patch.object(ccw.subprocess, "run", return_value=wslpath) as run, \
+                    mock.patch.object(ccw.subprocess, "Popen") as popen:
+                popen.return_value.wait.side_effect = (
+                    wait_rc if isinstance(wait_rc, list) else [wait_rc])
+                rc = ccw.main(argv, cwd=tmp, stdin=io.StringIO(), stdout=io.StringIO(), stderr=err)
+            # The WSL side takes the lock, never this side.
             self.assertFalse(os.path.exists(os.path.join(tmp, ".ccw.lock")))
+        self.which = which_mock
+        return rc, err.getvalue(), run, popen, tmp
+
+    def test_arguments_are_forwarded_to_wsl(self):
+        rc, err, run, popen, tmp = self.run_main(
+            self.ARGV, which=lambda name: self.WSL if name == "wsl" else None, wait_rc=7)
+        self.assertEqual(rc, 7)  # the WSL side's exit code is returned as is
+        self.which.assert_any_call("wsl")
+        script = os.path.abspath(CCW_PATH)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [self.WSL, "-e", "wslpath", "-u", script])
+        self.assertIs(run.call_args.kwargs["shell"], False)
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.args[0],
+                         [self.WSL, "-e", "python3", "/mnt/c/tools/ccw"] + self.ARGV)
+        self.assertEqual(popen.call_args.kwargs["cwd"], tmp)
+        self.assertIs(popen.call_args.kwargs["shell"], False)
+        self.assertIn("running ccw in WSL2 (/mnt/c/tools/ccw)", err)
+
+    def test_wsl_exe_name_is_also_found(self):
+        rc, _, _, popen, _ = self.run_main(
+            ["-i"], which=lambda name: self.WSL if name == "wsl.exe" else None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(popen.call_args.args[0][:3], [self.WSL, "-e", "python3"])
+
+    def test_ctrl_c_does_not_stop_waiting_for_wsl(self):
+        rc, _, _, popen, _ = self.run_main(
+            ["-i"], which=lambda name: self.WSL, wait_rc=[KeyboardInterrupt(), 130])
+        self.assertEqual(rc, 130)
+        self.assertEqual(popen.return_value.wait.call_count, 2)
+        popen.return_value.kill.assert_not_called()
+
+    def test_without_wsl_exits_1(self):
+        rc, err, run, popen, _ = self.run_main(["-i", "--", "--model", "opus"], which=lambda name: None)
         self.assertEqual(rc, 1)
-        self.assertIn(self.EXPECTED, err.getvalue())
-        self.assertIn("wsl ccw -i", err.getvalue())
-        self.assertEqual(out.getvalue(), "")
+        self.assertIn("wsl.exe was not found", err)
+        run.assert_not_called()
+        popen.assert_not_called()
+
+    def test_wslpath_failure_exits_1(self):
+        failed = subprocess.CompletedProcess([], 1, b"", "no distro".encode("utf-16-le"))
+        rc, err, _, popen, _ = self.run_main(["-i"], which=lambda name: self.WSL, wslpath=failed)
+        self.assertEqual(rc, 1)
+        self.assertIn("could not convert", err)
+        popen.assert_not_called()
+
+    def test_usage_errors_are_reported_before_delegating(self):
+        rc, err, run, popen, _ = self.run_main(["-i", "--stdin"], which=lambda name: self.WSL)
+        self.assertEqual(rc, 1)
+        run.assert_not_called()
+        popen.assert_not_called()
 
     @unittest.skipUnless(os.name == "nt", "native Windows only")
-    def test_native_windows_subprocess_has_no_traceback(self):
+    def test_native_windows_without_wsl_has_no_traceback(self):
+        env = dict(os.environ, PATH=os.path.dirname(sys.executable))  # no System32: no wsl.exe
         with tempfile.TemporaryDirectory() as tmp:
             result = subprocess.run(
-                [sys.executable, CCW_PATH, "--interactive"], cwd=tmp, capture_output=True,
+                [sys.executable, CCW_PATH, "--interactive"], cwd=tmp, env=env, capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=60, shell=False,
             )
             self.assertFalse(os.path.exists(os.path.join(tmp, ".ccw.lock")))
         self.assertEqual(result.returncode, 1)
-        self.assertIn(self.EXPECTED, result.stderr)
+        self.assertIn("wsl.exe was not found", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
 

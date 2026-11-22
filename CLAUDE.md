@@ -3,7 +3,7 @@
 ## Project Overview
 `ccw` is a zero-dependency, single-file Python CLI wrapper for Claude Code (`claude`). It runs `claude -p` headlessly, monitors the output for 5-hour session limit messages, calculates the reset timestamp, sleeps until the reset time, and automatically resumes with `claude <claude-options> --continue -p "<resume_prompt>"`. Options given after `--` are passed to claude on the initial run and on every resume.
 
-Interactive mode (`-i` / `--interactive`, POSIX only) instead runs claude's normal TUI inside a pseudo-terminal that `ccw` proxies transparently (raw stdin, output, `SIGWINCH` window size). On a limit hit the same claude process is kept open; after the reset time `ccw` writes `resume_prompt` and then `"\r"` to the PTY master, once per limit hit. On native Windows (`os.name == "nt"`) `-i` prints an error pointing to WSL2 and exits `1`.
+Interactive mode (`-i` / `--interactive`; PTY on POSIX) instead runs claude's normal TUI inside a pseudo-terminal that `ccw` proxies transparently (raw stdin, output, `SIGWINCH` window size). On a limit hit the same claude process is kept open; after the reset time `ccw` writes `resume_prompt` and then `"\r"` to the PTY master, once per limit hit. On native Windows (`os.name == "nt"`) `-i` is handed to ccw inside WSL2: `wsl.exe -e python3 <ccw as a WSL path> <same arguments>` in the same directory; only without `wsl.exe` does it exit `1`.
 
 ## Files
 - `ccw`: the whole program (no extension, `#!/usr/bin/env python3`).
@@ -22,10 +22,10 @@ On Windows use `python` instead of `python3` (`python3` is often the Microsoft S
 2. **Single-File Distribution:** All runtime logic must remain inside the single executable script `ccw`.
 3. **Line Endings & Encoding:** Always preserve LF (`\n`) line endings and UTF-8 (no BOM) encoding across all files, especially `ccw`.
 4. **Worktree Isolation:** Enforce single-instance execution per working directory via `.ccw.lock` PID checking.
-5. **No Shell:** Never use `shell=True`. On Windows never execute a `.cmd`/`.bat` with user-controlled arguments (cmd.exe re-parses them); resolve the npm shim to `claude.exe` / `node cli.js` instead.
+5. **No Shell:** Never use `shell=True`. Delegate to WSL2 with `wsl.exe -e` (never plain `wsl.exe <cmd>`, which goes through the Linux shell). On Windows never execute a `.cmd`/`.bat` with user-controlled arguments (cmd.exe re-parses them); resolve the npm shim to `claude.exe` / `node cli.js` instead.
 6. **Lock File Safety:** Create `.ccw.lock` with `O_CREAT | O_EXCL` (`0o600` on POSIX), refuse symlinks, and only remove a lock whose `pid` is our own.
 7. **Secrets:** Redact secrets (`sk-ant-...`, `AWS_SECRET_ACCESS_KEY=...`, `Bearer ...`, PEM keys, ...) before echoing child output. Prompts from `--stdin` / `--prompt-file` are piped to claude's stdin, never put in argv. In interactive mode redaction is width-preserving (`*` of the same length) and only touches text between escape sequences, so TUI cursor control is never altered.
-8. **Exit Codes:** `0` success, `1` usage/lock/claude-not-found/`-i` on native Windows, `2` max retries exceeded, `130` interrupted, otherwise claude's own exit code.
+8. **Exit Codes:** `0` success, `1` usage/lock/claude-not-found/`-i` on native Windows without WSL2, `2` max retries exceeded, `130` interrupted, otherwise claude's own exit code.
 9. **Terminal Safety (interactive):** Put the parent terminal into raw mode only inside a `try` whose `finally` restores the saved `termios` attributes. Import `pty` / `termios` / `tty` / `fcntl` lazily so `ccw` still loads on Windows. Limit detection runs on ANSI-stripped text; the screen always gets the (redacted) raw stream.
 
 ## Committing
