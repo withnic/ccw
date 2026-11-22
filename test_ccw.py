@@ -32,6 +32,8 @@ def _load_ccw():
 ccw = _load_ccw()
 
 NOW = datetime(2026, 11, 21, 10, 0, 0)
+# Added by ccw to every headless run unless --output-format is given after "--".
+SJ = ["--output-format", "stream-json", "--verbose"]
 
 
 class FakeClock:
@@ -445,7 +447,7 @@ class TestOptions(unittest.TestCase):
 
     def test_positional_prompt(self):
         opts = self.parse(["hello"])
-        self.assertEqual(opts.initial_args(), ["-p", "hello"])
+        self.assertEqual(opts.initial_args(), SJ + ["-p", "hello"])
         self.assertIsNone(opts.initial_stdin)
         self.assertEqual(opts.resume_prompt, "作業を再開してください")
         self.assertEqual((opts.max_retries, opts.fallback_wait, opts.buffer_sec), (5, 18000, 15))
@@ -457,8 +459,8 @@ class TestOptions(unittest.TestCase):
         extra = ["--model", "opus", "--allowedTools", "Bash(git:*)", "Edit"]
         self.assertEqual(opts.claude_args, extra)
         # "-p" comes after the options so a variadic option cannot swallow the prompt
-        self.assertEqual(opts.initial_args(), extra + ["-p", "x"])
-        self.assertEqual(opts.resume_args(), extra + ["--continue", "-p", "go"])
+        self.assertEqual(opts.initial_args(), extra + SJ + ["-p", "x"])
+        self.assertEqual(opts.resume_args(), extra + SJ + ["--continue", "-p", "go"])
 
     def test_reserved_claude_options_rejected(self):
         for opt in ("-p", "--print", "-c", "--continue", "-r", "--resume", "--resume=abc"):
@@ -467,7 +469,7 @@ class TestOptions(unittest.TestCase):
 
     def test_stdin_keeps_prompt_out_of_args(self):
         opts = self.parse(["--stdin", "--", "--model", "opus"], "secret prompt")
-        self.assertEqual(opts.initial_args(), ["--model", "opus", "-p"])
+        self.assertEqual(opts.initial_args(), ["--model", "opus"] + SJ + ["-p"])
         self.assertEqual(opts.initial_stdin, "secret prompt")
 
     def test_prompt_file(self):
@@ -476,7 +478,7 @@ class TestOptions(unittest.TestCase):
             with open(path, "w", encoding="utf-8-sig") as fh:
                 fh.write("ファイルのプロンプト")
             opts = self.parse(["--prompt-file", path])
-        self.assertEqual(opts.initial_args(), ["-p"])
+        self.assertEqual(opts.initial_args(), SJ + ["-p"])
         self.assertEqual(opts.initial_stdin, "ファイルのプロンプト")
 
     def test_errors(self):
@@ -594,8 +596,8 @@ class TestEndToEndInProcess(MockClaudeTestCase):
         self.assertEqual(rc, 0, err)
         calls = self.calls()
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0]["argv"], ["-p", "初回プロンプト"])
-        self.assertEqual(calls[1]["argv"], ["--continue", "-p", "続けて"])
+        self.assertEqual(calls[0]["argv"], SJ + ["-p", "初回プロンプト"])
+        self.assertEqual(calls[1]["argv"], SJ + ["--continue", "-p", "続けて"])
         self.assertEqual(calls[0]["pythonutf8"], "1")
         # 10:00 -> 15:00 plus the 15 second buffer
         self.assertAlmostEqual(clock.slept, 5 * 3600 + 15, places=3)
@@ -611,14 +613,14 @@ class TestEndToEndInProcess(MockClaudeTestCase):
         self.assertEqual(rc, 0, err)
         calls = self.calls()
         extra = ["--model", "opus", "--permission-mode", "acceptEdits"]
-        self.assertEqual(calls[0]["argv"], extra + ["-p", "初回"])
-        self.assertEqual(calls[1]["argv"], extra + ["--continue", "-p", "作業を再開してください"])
+        self.assertEqual(calls[0]["argv"], extra + SJ + ["-p", "初回"])
+        self.assertEqual(calls[1]["argv"], extra + SJ + ["--continue", "-p", "作業を再開してください"])
 
     def test_stdin_prompt_is_piped_not_in_argv(self):
         rc, _, err, _ = self.run_main(["--stdin"], mode="ok", stdin_text="秘密の指示")
         self.assertEqual(rc, 0, err)
         call = self.calls()[0]
-        self.assertEqual(call["argv"], ["-p"])
+        self.assertEqual(call["argv"], SJ + ["-p"])
         self.assertEqual(call["stdin"].replace("\r\n", "\n"), "秘密の指示")
 
     def test_non_limit_error_propagates_without_sleep(self):
@@ -720,7 +722,7 @@ class TestEndToEndSubprocess(MockClaudeTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
         self.assertEqual([c["argv"] for c in calls],
-                         [["-p", "hello"], ["--continue", "-p", "作業を再開してください"]])
+                         [SJ + ["-p", "hello"], SJ + ["--continue", "-p", "作業を再開してください"]])
         self.assertIn("日本語の出力: done", result.stdout)
         self.assertNotIn("SECRETSECRET", result.stdout)
         self.assertFalse(os.path.exists(os.path.join(self.work, ".ccw.lock")))
@@ -731,14 +733,14 @@ class TestEndToEndSubprocess(MockClaudeTestCase):
             fh.write("file prompt")
         result = self.run_ccw(["--prompt-file", prompt], mode="ok")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls()[0]["argv"], ["-p"])
+        self.assertEqual(self.calls()[0]["argv"], SJ + ["-p"])
         self.assertEqual(self.calls()[0]["stdin"].strip(), "file prompt")
 
     def test_shell_metacharacters_are_literal(self):
         payload = 'a & echo pwned > pwned.txt | "b" $(whoami) `id`'
         result = self.run_ccw([payload], mode="ok")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.calls()[0]["argv"], ["-p", payload])
+        self.assertEqual(self.calls()[0]["argv"], SJ + ["-p", payload])
         self.assertFalse(os.path.exists(os.path.join(self.work, "pwned.txt")))
 
     def test_piped_output_is_utf8_without_pythonioencoding(self):
@@ -887,6 +889,388 @@ class TestOutputEncoding(unittest.TestCase):
 
     def test_stream_without_isatty(self):
         self.assertFalse(ccw._wants_utf8(object(), {}, is_windows=True))
+
+
+# --------------------------------------------------------------------------
+# 5b. Headless progress: stream-json events, spinner, --quiet
+# --------------------------------------------------------------------------
+
+
+class FakeTTY(io.StringIO):
+    """A StringIO that claims to be a terminal of ``columns`` width."""
+
+    def __init__(self, columns=80):
+        super().__init__()
+        self.columns = columns
+
+    def isatty(self):
+        return True
+
+    def fileno(self):
+        raise OSError("no fd")
+
+
+def _event(obj):
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _tool_use(name, tool_input):
+    return _event({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": name, "input": tool_input}]}})
+
+
+MOCK_STREAM_CLAUDE = textwrap.dedent(
+    r'''
+    import json, os, sys
+    state_path = os.environ["MOCK_STATE"]
+    try:
+        with open(state_path, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
+        state = {"calls": []}
+    state["calls"].append({"argv": sys.argv[1:]})
+    with open(state_path, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+    n = len(state["calls"])
+    def emit(obj):
+        print(json.dumps(obj, ensure_ascii=False), flush=True)
+    emit({"type": "system", "subtype": "init", "session_id": "s"})
+    emit({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "Let me look."},
+        {"type": "tool_use", "id": "a", "name": "Read", "input": {"file_path": "CLAUDE.md"}}]}})
+    # A tool result may contain anything (file contents, secrets): never printed.
+    emit({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "a", "content": "TOOL_RESULT_BODY sk-ant-api03-SECRETSECRETSECRET"}]}})
+    emit({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "b", "name": "Edit", "input": {"file_path": "ccw"}}]}})
+    print("not json at all {", flush=True)  # e.g. a warning on the merged stderr
+    if os.environ.get("MOCK_MODE") == "limit_then_ok" and n == 1:
+        emit({"type": "result", "subtype": "success", "is_error": True,
+              "result": os.environ.get("MOCK_LIMIT_LINE", "Claude usage limit reached. Your limit will reset at 3pm.")})
+        sys.exit(1)
+    emit({"type": "result", "subtype": "success", "is_error": False,
+          "result": "最終回答: done\nsecond line sk-ant-api03-SECRETSECRETSECRET"})
+    sys.exit(0)
+    '''
+)
+
+
+class TestStreamJsonParsing(unittest.TestCase):
+    def test_plain_and_invalid_lines_are_text(self):
+        for line in ("hello\n", "{not json\n", "123\n", '["a"]\n', '{"no_type": 1}\n', "\n"):
+            with self.subTest(line=line):
+                self.assertIsNone(ccw.parse_stream_event(line))
+        self.assertEqual(ccw.parse_stream_event('  {"type": "result", "result": "x"}\n')["type"], "result")
+
+    def test_tool_uses_and_text(self):
+        event = ccw.parse_stream_event(_event({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "a"}, {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "tool_use", "name": "Write", "input": {"file_path": "x.py"}}, "junk"]}}))
+        self.assertEqual(ccw.iter_tool_uses(event), [("Bash", {"command": "ls"}), ("Write", {"file_path": "x.py"})])
+        self.assertEqual(ccw.assistant_text(event), "a")
+        self.assertEqual(ccw.iter_tool_uses({"type": "assistant", "message": "odd"}), [])
+
+    def test_result_text(self):
+        self.assertEqual(ccw.result_text({"type": "result", "result": "done"}), "done")
+        self.assertEqual(ccw.result_text({"type": "result", "subtype": "error_during_execution",
+                                          "errors": ["boom", 3]}), "boom")
+        self.assertIsNone(ccw.result_text({"type": "result"}))
+
+    def test_describe_tool_use(self):
+        cwd = os.path.abspath(HERE)
+        cases = [
+            ("Read", {"file_path": os.path.join(cwd, "CLAUDE.md")}, "Read: CLAUDE.md"),
+            ("Edit", {"file_path": "ccw"}, "Edit: ccw"),
+            ("Write", {"file_path": "test_ccw.py"}, "Write: test_ccw.py"),
+            ("Bash", {"command": "python3 -m unittest\n  -v test_ccw.py", "description": "run"},
+             "Bash: python3 -m unittest -v test_ccw.py"),
+            ("Grep", {"pattern": "TODO", "path": "."}, "Grep: TODO"),
+            ("mcp__x__fetch", {"url": "https://example.com"}, "mcp__x__fetch: https://example.com"),
+            ("TodoWrite", {"todos": []}, "TodoWrite"),
+        ]
+        for name, tool_input, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(ccw.describe_tool_use(name, tool_input, cwd), expected)
+
+    def test_describe_tool_use_redacts_and_strips_controls(self):
+        text = ccw.describe_tool_use("Bash", {"command": "curl -H 'Authorization: Bearer abcdefghijklmnop' "
+                                                         "\x1b[31mx\x1b[0m; export GITHUB_TOKEN=ghp_abcdefghij"})
+        self.assertNotIn("abcdefghijklmnop", text)
+        self.assertNotIn("ghp_abcdefghij", text)
+        self.assertNotIn("\x1b", text)
+        self.assertIn("***REDACTED***", text)
+        long = ccw.describe_tool_use("Bash", {"command": "x" * 1000})
+        self.assertLessEqual(len(long), len("Bash: ") + ccw.TOOL_TARGET_MAX)
+
+
+class RecordingProgress(ccw.ProgressDisplay):
+    def __init__(self):
+        super().__init__(io.StringIO(), enabled=False)
+        self.statuses = []
+
+    def set_status(self, text):
+        self.statuses.append(text)
+        super().set_status(text)
+
+
+class TestStreamJsonRunner(unittest.TestCase):
+    """ChildRunner with a child that prints stream-json events."""
+
+    def run_child(self, lines, stream_json=True):
+        script = "import sys\nfor line in %r:\n    print(line, flush=True)\nsys.exit(%d)\n"
+        out, progress = io.StringIO(), RecordingProgress()
+        runner = ccw.ChildRunner(out, progress=progress, cwd=HERE)
+        rc, buffer = runner.run([sys.executable, "-c", script % (lines, 1)], stream_json=stream_json)
+        return rc, out.getvalue(), list(buffer), progress
+
+    def test_tool_use_then_result(self):
+        rc, out, buffer, progress = self.run_child([
+            _event({"type": "system", "subtype": "init"}),
+            _tool_use("Read", {"file_path": "CLAUDE.md"}),
+            _event({"type": "user", "message": {"content": [{"type": "tool_result", "content": "FILE BODY"}]}}),
+            _tool_use("Bash", {"command": "python3 -m unittest -v test_ccw.py"}),
+            _event({"type": "result", "subtype": "success", "result": "All tests pass.\nBye"}),
+        ])
+        self.assertEqual(progress.statuses, ["Read: CLAUDE.md", "Bash: python3 -m unittest -v test_ccw.py"])
+        self.assertEqual(out, "All tests pass.\nBye\n")  # only the answer, as plain claude -p
+        self.assertNotIn("FILE BODY", out)
+        self.assertFalse(ccw.detect_limit(buffer, NOW).detected)
+
+    def test_tool_use_then_limit_result(self):
+        _, out, buffer, progress = self.run_child([
+            _tool_use("Edit", {"file_path": "ccw"}),
+            _event({"type": "result", "subtype": "success", "is_error": True,
+                    "result": "5-hour limit reached ∙ resets 3pm"}),
+        ])
+        self.assertEqual(progress.statuses, ["Edit: ccw"])
+        self.assertIn("5-hour limit reached", out)
+        info = ccw.detect_limit(buffer, NOW)
+        self.assertTrue(info.detected)
+        self.assertEqual(info.reset_at, datetime(2026, 11, 21, 15, 0))
+
+    def test_result_is_redacted(self):
+        _, out, buffer, _ = self.run_child([
+            _event({"type": "result", "result": "key sk-ant-api03-SECRETSECRETSECRET"})])
+        self.assertNotIn("SECRETSECRET", out)
+        self.assertNotIn("SECRETSECRET", "".join(buffer))
+
+    def test_missing_result_falls_back_to_last_text(self):
+        _, out, buffer, _ = self.run_child([
+            _event({"type": "assistant", "message": {"content": [{"type": "text", "text": "thinking aloud"}]}}),
+            _event({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "Claude usage limit reached. Your limit will reset at 3pm."}]}}),
+        ])
+        self.assertEqual(out, "Claude usage limit reached. Your limit will reset at 3pm.\n")
+        self.assertTrue(ccw.detect_limit(buffer, NOW).detected)
+
+    def test_plain_text_child_is_unchanged(self):
+        lines = ["working...", "Claude usage limit reached. Your limit will reset at 3pm."]
+        for stream_json in (True, False):
+            with self.subTest(stream_json=stream_json):
+                rc, out, buffer, progress = self.run_child(lines, stream_json=stream_json)
+                self.assertEqual(rc, 1)
+                self.assertEqual(out.replace("\r\n", "\n"), "\n".join(lines) + "\n")
+                self.assertTrue(ccw.detect_limit(buffer, NOW).detected)
+                self.assertEqual(progress.statuses, [])
+
+    def test_json_is_passed_through_without_stream_json(self):
+        line = _event({"type": "result", "result": "x"})
+        _, out, _, _ = self.run_child([line], stream_json=False)
+        self.assertEqual(out.strip(), line)
+
+
+class TestQuietOption(unittest.TestCase):
+    def parse(self, argv):
+        return ccw.parse_options(argv, io.StringIO(""))
+
+    def test_quiet_flags(self):
+        self.assertFalse(self.parse(["x"]).quiet)
+        self.assertTrue(self.parse(["-q", "x"]).quiet)
+        self.assertTrue(self.parse(["--quiet", "x"]).quiet)
+        self.assertTrue(self.parse(["x", "--quiet", "--", "--model", "opus"]).quiet)
+        self.assertTrue(self.parse(["-i", "-q"]).quiet)  # accepted, no effect with -i
+
+    def test_quiet_keeps_stream_json(self):
+        self.assertEqual(self.parse(["-q", "x"]).initial_args(), SJ + ["-p", "x"])
+
+    def test_explicit_output_format_disables_stream_json(self):
+        for extra in (["--output-format", "json"], ["--output-format=text"], ["--output-format", "stream-json"]):
+            with self.subTest(extra=extra):
+                opts = self.parse(["x", "--", *extra])
+                self.assertFalse(opts.stream_json)
+                self.assertEqual(opts.initial_args(), extra + ["-p", "x"])
+
+    def test_verbose_is_not_added_twice(self):
+        opts = self.parse(["x", "--", "--verbose"])
+        self.assertEqual(opts.initial_args(), ["--verbose", "--output-format", "stream-json", "-p", "x"])
+
+    def test_interactive_never_adds_output_format(self):
+        opts = self.parse(["-i", "x", "--", "--model", "opus"])
+        self.assertEqual(opts.interactive_args(), ["--model", "opus", "--", "x"])
+
+
+class TestProgressEnabled(unittest.TestCase):
+    def test_tty_not_quiet(self):
+        self.assertTrue(ccw.progress_enabled(False, FakeTTY()))
+
+    def test_tty_quiet(self):
+        self.assertFalse(ccw.progress_enabled(True, FakeTTY()))
+
+    def test_not_a_tty(self):
+        self.assertFalse(ccw.progress_enabled(False, io.StringIO()))
+        self.assertFalse(ccw.progress_enabled(False, object()))
+
+    def test_main_enables_progress_only_on_a_tty_without_quiet(self):
+        seen = []
+        real_init = ccw.ProgressDisplay.__init__
+
+        def spy(self, *args, **kwargs):
+            real_init(self, *args, **kwargs)
+            seen.append(self)
+
+        cases = [([], FakeTTY(), True), (["-q"], FakeTTY(), False), ([], io.StringIO(), False)]
+        for flags, err, expected in cases:
+            with self.subTest(flags=flags, tty=isinstance(err, FakeTTY)), tempfile.TemporaryDirectory() as tmp:
+                seen.clear()
+                with mock.patch.object(ccw.ProgressDisplay, "__init__", spy):
+                    rc = ccw.main([*flags, "x"], claude_cmd=[sys.executable, "-c", "print('ok')"], cwd=tmp,
+                                  stdin=io.StringIO(), stdout=io.StringIO(), stderr=err)
+                self.assertEqual(rc, 0)
+                self.assertEqual(seen[0].enabled, expected)
+                if not expected:
+                    self.assertNotIn("\r", err.getvalue())
+
+
+class TestProgressDisplay(unittest.TestCase):
+    def make(self, columns=80, enabled=True):
+        clock = [100.0]
+        stream = FakeTTY(columns)
+        display = ccw.ProgressDisplay(stream, enabled=enabled, monotonic=lambda: clock[0])
+        display._columns = lambda: max(1, stream.columns - 1)
+        return display, stream, clock
+
+    def test_line_format(self):
+        display, _, clock = self.make()
+        display.start()
+        self.addCleanup(display.stop)
+        display._stop.set()  # keep the thread from racing the asserts
+        clock[0] += 14.2
+        with display._lock:
+            display._frame = 0
+            self.assertEqual(display.line(), "⠋ [00m 14s] Claude is thinking...")
+            display.set_status("Edit: ccw")
+            clock[0] += 3600
+            self.assertEqual(display.line(), "⠋ [1h 00m 14s] Edit: ccw")
+
+    def test_show_truncates_and_clears(self):
+        display, stream, _ = self.make(columns=20)
+        display.show("⠋ [00m 05s] Bash: " + "あ" * 30)
+        drawn = stream.getvalue()
+        self.assertTrue(drawn.startswith("\r"))
+        self.assertLessEqual(ccw.display_width(drawn[1:]), 19)
+        self.assertTrue(drawn.endswith("..."))
+        display.show("short")  # pads over the longer previous line
+        self.assertEqual(ccw.display_width(stream.getvalue()[len(drawn) + 1:]), 19)
+        display.clear()
+        self.assertTrue(stream.getvalue().endswith("\r" + " " * 19 + "\r"))
+        before = stream.getvalue()
+        display.clear()  # nothing drawn: nothing written
+        self.assertEqual(stream.getvalue(), before)
+
+    def test_paused_clears_before_writing(self):
+        display, stream, _ = self.make()
+        display.show("status")
+        with display.paused():
+            stream.write("[ccw] message\n")
+        self.assertTrue(stream.getvalue().endswith("\r      \r[ccw] message\n"))
+
+    def test_disabled_writes_nothing(self):
+        display, stream, _ = self.make(enabled=False)
+        display.start()
+        display.show("x")
+        display.stop()
+        self.assertEqual(stream.getvalue(), "")
+        self.assertIsNone(display._thread)
+
+    def test_thread_draws_and_stops(self):
+        display, stream, _ = self.make()
+        display.interval = 0.01
+        display.start()
+        deadline = time.monotonic() + 5
+        while "Claude is thinking" not in stream.getvalue() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        display.stop()
+        self.assertIn("Claude is thinking", stream.getvalue())
+        self.assertTrue(stream.getvalue().endswith("\r"))  # line cleared
+        self.assertIsNone(display._thread)
+
+    def test_countdown_text(self):
+        target = datetime(2026, 11, 21, 15, 0)
+        self.assertEqual(ccw.countdown_text(target, NOW, 2 * 3600 + 14 * 60 + 30),
+                         "⏳ [ccw] Rate limit reached. Resuming at 15:00 (02h 14m 30s remaining)...")
+        self.assertIn("2026-11-22 03:00", ccw.countdown_text(datetime(2026, 11, 22, 3, 0), NOW, 60))
+
+    def test_wait_until_with_countdown(self):
+        clock = FakeClock(NOW)
+        target = NOW + timedelta(seconds=3.5)
+        logs, shown = [], []
+        ccw.wait_until(target, clock.now, clock.sleep, logs.append,
+                       lambda t, now, remaining: shown.append(remaining))
+        self.assertEqual(shown, [3.5, 2.5, 1.5, 0.5])
+        self.assertEqual(logs, [])
+        self.assertAlmostEqual(clock.slept, 3.5)
+
+
+class TestStreamJsonEndToEnd(MockClaudeTestCase):
+    def setUp(self):
+        super().setUp()
+        with open(self.mock, "w", encoding="utf-8") as fh:
+            fh.write(MOCK_STREAM_CLAUDE)
+
+    def run_stream(self, argv, stderr, mode="ok", **env):
+        os.environ["MOCK_MODE"] = mode
+        os.environ.update(env)
+        clock = FakeClock(NOW)
+        out = io.StringIO()
+        rc = ccw.main(argv, claude_cmd=self.claude_cmd, cwd=self.work, stdin=io.StringIO(),
+                      stdout=out, stderr=stderr, now_fn=clock.now, sleep_fn=clock.sleep)
+        return rc, out.getvalue(), stderr.getvalue(), clock
+
+    def test_result_is_printed_and_events_are_hidden(self):
+        rc, out, err, _ = self.run_stream(["-q", "x"], io.StringIO())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.calls()[0]["argv"], SJ + ["-p", "x"])
+        self.assertIn("最終回答: done", out)
+        self.assertIn("not json at all {", out)
+        self.assertNotIn("SECRETSECRET", out)
+        self.assertNotIn("TOOL_RESULT_BODY", out)
+        self.assertNotIn('"type"', out)
+        self.assertEqual(err, "")
+
+    def test_limit_in_result_then_resume(self):
+        rc, out, err, clock = self.run_stream(["--quiet", "x"], io.StringIO(), mode="limit_then_ok")
+        self.assertEqual(rc, 0, err)
+        calls = self.calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["argv"], SJ + ["--continue", "-p", "作業を再開してください"])
+        self.assertAlmostEqual(clock.slept, 5 * 3600 + 15, places=3)
+        self.assertIn("session limit detected: Claude usage limit reached", err)
+        self.assertIn("waiting for limit reset", err)   # minute log lines without the display
+        self.assertNotIn("\r", err)
+        self.assertNotIn("⏳", err)
+
+    def test_tty_shows_countdown_and_clears_lines(self):
+        err = FakeTTY()
+        rc, out, text, clock = self.run_stream(
+            ["x"], err, mode="limit_then_ok", MOCK_LIMIT_LINE="5-hour limit reached, resets in 2 minutes")
+        self.assertEqual(rc, 0, text)
+        self.assertIn("⏳ [ccw] Rate limit reached. Resuming at 10:02 (00h 02m 15s remaining)...", text)
+        self.assertNotIn("waiting for limit reset", text)  # replaced by the countdown
+        self.assertIn(" \r[ccw] resuming session (1/5)", text)  # countdown line cleared first
+        self.assertTrue(text.endswith("\r") or text.endswith("\n"))
+        self.assertAlmostEqual(clock.slept, 135.0, places=3)
+        self.assertIn("最終回答: done", out)
+        self.assertNotIn("\r", out)
 
 
 # --------------------------------------------------------------------------

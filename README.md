@@ -57,6 +57,7 @@ ccw --dry-run "Make all tests pass"
 | `--stdin` | | Read the initial prompt from stdin |
 | `--prompt-file PATH` | | Read the initial prompt from a UTF-8 file |
 | `--dry-run` | | Parse arguments and test the lock only |
+| `-q`, `--quiet` | | Do not show the progress line (spinner, current tool, reset countdown) |
 | `-i`, `--interactive` | | Keep claude's interactive TUI and type the resume prompt into the same session (see "Interactive mode" below) |
 
 Give the prompt to `ccw`, not after `--`. `-p`/`--print`, `-c`/`--continue` and `-r`/`--resume` are managed by `ccw` and are rejected after `--` (with `-i`, only `-p`/`--print` is).
@@ -79,6 +80,17 @@ Give the prompt to `ccw`, not after `--`. `-p`/`--print`, `-c`/`--continue` and 
 4. Resumes with `claude <claude-options> --continue -p "<resume prompt>"` and repeats from step 2.
 
 `ccw`'s own messages go to stderr with a `[ccw]` prefix.
+
+### Progress display
+
+A headless run would otherwise print nothing until claude's final answer. When stderr is a terminal, `ccw` shows one line that is overwritten in place:
+
+```text
+⠋ [00m 14s] Edit: ccw
+⏳ [ccw] Rate limit reached. Resuming at 15:00 (02h 14m 30s remaining)...
+```
+
+For this, `ccw` adds `--output-format stream-json --verbose` to claude's options and prints only the final answer to stdout, as plain `claude -p` would. Tool targets in the line are redacted like the rest of the output. The line is cut to the terminal width and cleared before any real output. It is never drawn when stderr is a pipe or a file, or with `-q` / `--quiet`. If you pass `--output-format` yourself after `--`, claude's output is passed through unchanged and the line only shows the elapsed time.
 
 ## Interactive mode (`-i` / `--interactive`)
 
